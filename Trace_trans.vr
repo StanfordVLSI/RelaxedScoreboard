@@ -1,0 +1,327 @@
+#ifndef INC_TRACE_TRANS
+#define INC_TRACE_TRANS
+
+//////////////////////////////////////////////////////////////////////////////
+// File name: Trace_trans.vr
+// This file contains a transaction structure for commands sent from the
+// monitor observing CPU commands, to the scoreboard keeping track
+// of memory operations.
+//////////////////////////////////////////////////////////////////////////////
+
+
+//------------------------------------------------------------------------------
+//----- Include Related Files Here
+//------------------------------------------------------------------------------
+// Main source file for tile testbench
+#include <vera_defines.vrh>
+#include <VeraErrorHandler.vrh>
+#include "Quad_def.vrh"
+#include "generic_trans.vrh"
+#include "RandomParams_def.vrh"
+#include "RandomTasks.vrh"
+
+
+// declare external tasks/classes/functions here if necessary
+
+//------------------------------------------------------------------------------
+//----- Place Special Definitions Here
+//------------------------------------------------------------------------------
+
+// --- Some of the definitions are placed in FromTheVerilog_defs.vrh
+
+//------------------------------------------------------------------------------
+//----- Place Auxiliary Classes Here
+//------------------------------------------------------------------------------
+class Trace_trans extends GENERIC_trans
+{
+  // control variables (inherited)
+  //---------------------------------
+//  protected integer active;
+//  protected integer my_ID; // the ID of the instance
+//  protected string comment;
+//  protected integer my_creation_time;
+
+  // Transaction fields
+  //-------------------
+  integer senderID; // ID of sender entity, as defined in Quad_def.vrh
+  bit [31:0] destinationAddr; //should be translated by scoreboard into phys.
+  bit [7:0] data; //write data if it's a write operation, or the data returned
+  bit [63:0] timeStart; // when was this transaction started
+  bit [63:0] timeEnd;  // when did this transaction end.
+  integer operation; //which operation was this? use enumerated values.
+  bit [63:0] is_valid_for_cpu[*]; /* What is the last clock that a cpu can be
+                                   * influenced by this transaction
+                                   */
+  integer num_cpus;
+  bit transactional; /*Is this a non-committed transaction.*/
+
+  bit locked;//don't delete this transaction (GC it) if it is part of an outstanding transaction.
+  
+  static integer currentTransID;
+    
+  // Constructor 
+  //-------------
+  task new(integer num_cpus);
+
+
+  // Utility tasks (overrides super-class definition)
+  //--------------------------------------------------
+  task AssignValues(integer _senderID,
+                    bit [31:0] _destinationAddr,
+                    bit [7:0] _data,
+                    bit[63:0] _timeStart,
+                    bit[63:0] _timeEnd,
+                    integer _operation,
+                    string _comment = ""
+                    );
+  task PrintMe();
+  task PrintMeShort();
+  task LogMeToFile(integer log_file_handle = 0);
+  task LogMeToFileShort(integer log_file_handle = 0);
+  function string GetOp();
+
+  
+  task Init(integer DEBUG_ = 0, integer log_file_handle_ = 0,
+            string my_agent_name_ = "NoAgent", string my_type_ = "NoType")
+  {
+
+    /*Initialize the transaction ID counter to 0.*/
+    currentTransID = 0;
+    
+  }
+  
+
+  // Called to increment the ID without new-ing a
+  // transaction. This is useful for associating
+  // the transactions with eachother (ie, ID%4 for the
+  // four possible bytes of a transaction)
+  task IncrementCurrentTransID(){
+    currentTransID = currentTransID + 1;
+  }
+
+  /*simplifing function to get the maximum valid time
+   * for the 8 CPUs
+   */
+  function bit[63:0] getMaxIsValidForCPU();
+
+}
+//----------------------------------------
+task Trace_trans::new(integer my_num_cpus)
+{
+  integer idx = 0;
+  
+  my_ID = currentTransID ++;
+  senderID = 32'hXXXX_XXXX;
+  destinationAddr = 32'hXXXX_XXXX;
+  data = 8'hXX;
+  timeStart = 0;
+  timeEnd = 0;
+  operation = 0; /*noop*/
+  num_cpus = my_num_cpus;
+  transactional = 0;
+  locked = 0;
+  // Initially, transactions are valid for all CPUs forever
+  // Note that idx of 0 to 7 corrosponde to TILE0P0_ID to TILE3P1_ID
+  is_valid_for_cpu = new[num_cpus];
+  for (idx=0;idx<num_cpus;idx++)
+    is_valid_for_cpu[idx] = INFINITY;
+
+}
+//----------------------------------------
+task Trace_trans::AssignValues(integer _senderID,
+                               bit [31:0] _destinationAddr,
+                               bit [7:0] _data,   
+                               bit[63:0] _timeStart,
+                               bit[63:0] _timeEnd,
+                               integer _operation,
+                               string _comment = "")
+{
+  super.AssignValues();
+  senderID = _senderID;
+  destinationAddr = _destinationAddr;
+  data =  _data;   
+  timeStart = _timeStart;
+  timeEnd = _timeEnd;
+  operation = _operation;
+  comment = _comment;
+  transactional = 0;
+  locked = 0;
+}
+//----------------------------------------
+
+function bit[63:0] Trace_trans::getMaxIsValidForCPU(){
+
+  integer idx;
+  bit [63:0] maxTime = 0;
+  for (idx = 0; idx < num_cpus; idx++){
+    if (is_valid_for_cpu[idx] > maxTime){
+      maxTime = is_valid_for_cpu[idx];
+    }
+  }
+  getMaxIsValidForCPU = maxTime;
+  return;
+}
+
+
+
+//------------------------------------------
+// Trace_trans::GetOp()        
+function string Trace_trans::GetOp()
+{
+  case (operation)
+  {
+    S_LOAD 		:	 GetOp = "LOAD";
+    S_STORE 		:	 GetOp = "STORE";   
+    S_METALOAD 		:	 GetOp = "METALOAD"; 
+    S_METASTORE 	:	 GetOp = "METASTORE"; 
+    S_SYNCLOAD 		:	 GetOp = "SYNCLOAD";   
+    S_SYNCSTORE 	:	 GetOp = "SYNCSTORE";  
+    S_RESETLOAD 	:	 GetOp = "RESETLOAD";  
+    S_SETSTORE 		:	 GetOp = "SETSTORE";   
+    S_FUTURELOAD 	:	 GetOp = "FUTURELOAD"; 
+    S_RAWLOAD 		:	 GetOp = "RAWLOAD";    
+    S_RAWSTORE 		:	 GetOp = "RAWSTORE";   
+    S_RAWMETALOAD 	:	 GetOp = "RAWMETALOAD";
+    S_RAWMETASTORE 	:	 GetOp = "RAWMETASTORE";
+    S_FIFOLOAD 		:	 GetOp = "FIFOLOAD";    
+    S_FIFOSTORE 	:	 GetOp = "FIFOSTORE";
+    S_CACHEGANGCLEAR 	:	 GetOp = "CACHEGANGCLEAR"; 
+    S_CACHECONDGANGCLEAR:	 GetOp = "CACHECONDGANGCLR"; 
+    S_MATGANGCLEAR 	:	 GetOp = "MATGANGCLEAR";       
+    S_MATCONDGANGCLEAR 	:	 GetOp = "MATCONDGANGCLR";   
+    S_HARDINTCLEAR 	:	 GetOp = "HARDINTCLEAR";       
+    S_SAFE_LOAD 	:	 GetOp = "SAFE_LOAD";          
+    S_SM_DHWB 		:	 GetOp = "SM_DHWB";            
+    S_SM_DHWBI 		:	 GetOp = "SM_DHWBI";           
+    S_SM_DHI 		:	 GetOp = "SM_DHI";             
+    S_SM_DII 		:	 GetOp = "SM_DII";             
+    S_SM_DIWB 		:	 GetOp = "SM_DIWB";            
+    S_SM_DIWBI 		:	 GetOp = "SM_DIWBI";           
+    S_SM_DPFR 		:	 GetOp = "SM_DPFR";            
+    S_SM_DPFW 		:	 GetOp = "SM_DPFW";            
+    S_SM_IHI 		:	 GetOp = "SM_IHI";             
+    S_SM_III 		:	 GetOp = "SM_III";            
+    S_SM_IPF 		:	 GetOp = "SM_IPF";             
+    default:
+    {
+      GetOp = "ERROR";
+      fprintf (stderr,
+               "\n%8d: Trace_trans ERROR: undefined opcode: %b\n\n"
+               , get_cycle(), operation);
+      printf ("\n%8d: Trace_trans ERROR: undefined opcode: %b\n\n"
+              , get_cycle(), operation);
+    }
+  }
+}
+
+
+
+task Trace_trans::PrintMeShort(){
+
+printf( "id=%8d sender=%4d ts=%7d te=%7d opcode=%5h a=%8x d=%2x\n",
+        my_ID, senderID, timeStart-1, timeEnd-1, operation, destinationAddr, data );  
+}    
+//----------------------------------------
+task Trace_trans::PrintMe()
+{
+  integer i;
+  
+  printf("|%8d|%8d|%4d|%5h|%8x|%2x"
+         "|%8d|%8d",
+         my_ID,my_creation_time,senderID,operation, destinationAddr, data,
+         timeStart, timeEnd );
+    for (i=0; i<num_cpus; i++)
+    {   
+      if (is_valid_for_cpu[i] == INFINITY)
+        printf("|%0d:INF", i);
+      else
+        printf("|%0d:%0d", i, is_valid_for_cpu[i]);
+    }
+
+    printf("|%s\n", comment);
+    
+}
+//----------------------------------------
+task Trace_trans::LogMeToFile(integer log_file_handle = 0)
+{
+  integer i=0;
+  if (log_file_handle == 0)
+    return;
+  else
+  {
+    /*
+             "|ID      |TCreated|Sndr|Op   |Addr    |D |Start   |End     |T|L|Valid For Each|Comment\n"
+             "|        |        | ID |     |        |a |Time    |Time    |C|o|CPU Until:    |\n"
+             "|        |        |    |     |        |t |        |        |C|c|              |\n"
+             "|        |        |    |     |        |a |        |        | |k|              |\n"
+             "|        |        |    |     |        |  |        |        | |e|              |\n"
+             "|        |        |    |     |        |  |        |        | |d|              |\n"
+             "|        |        |    |     |        |  |        |        | | |             |\n"
+             "|--------|--------|----|-----|--------|--|--------|--------|-|-|-----------|\n");
+            //|8       |8       |4   |5    |8       |2 |8       |8       |1|1|             |
+    */
+    fprintf(log_file_handle,
+            "|%8d|%8d|%4d|%5h|%8x|%2x"
+            "|%8d",
+            my_ID,my_creation_time,senderID,operation, destinationAddr, data,
+            timeStart);
+    if (timeEnd == INFINITY){
+      fprintf(log_file_handle, "|     INF");
+    }
+    else{
+      fprintf(log_file_handle, "|%8d", timeEnd );
+    }
+    fprintf(log_file_handle, "|%s|%s", transactional?"Y":" ", locked?"Y":" ");
+    for ( i=0; i<num_cpus; i++)
+    {
+      if (is_valid_for_cpu[i] == INFINITY)
+        fprintf(log_file_handle,"|%0d:INF", i);
+      else
+        fprintf(log_file_handle,"|%0d:%0d", i, is_valid_for_cpu[i]);
+    }
+
+    fprintf(log_file_handle, "|%s\n", comment);
+  }
+}
+
+//----------------------------------------------------------------------
+
+task Trace_trans::LogMeToFileShort(integer log_file_handle = 0)
+{
+  integer i=0;
+  if (log_file_handle == 0)
+    return;
+  else
+  {
+    /*
+             "|TransID |Sndr|O    |Addr    |D |Start   |End     |T|Comment\n"
+             "|        | ID |p    |        |a |Time    |Time    |C|\n"
+             "|        |    |c    |        |t |        |        |C|\n"
+             "|        |    |o    |        |a |        |        | |\n"
+             "|        |    |d    |        |  |        |        | |\n"
+             "|        |    |e    |        |  |        |        | |\n"
+             "|        |    |     |        |  |        |        | |\n"
+             "|--------|----|-----|--------|--|--------|--------|-|\n");
+            //|8       |4   |5    |8       |2 |8       |8       |1|
+    */
+    fprintf(log_file_handle,
+            "|%8d|%4d|%5h|%8x|%2x"
+            "|%8d|",
+            my_ID,senderID,operation, destinationAddr, data,
+            timeStart);
+    if (timeEnd == INFINITY){
+      fprintf(log_file_handle, "     INF|");
+    }
+    else{
+      fprintf(log_file_handle, "%8d|", timeEnd);
+    }
+    fprintf(log_file_handle,"%s|%s\n", transactional?"Y":" ", comment);
+    
+  }
+    
+}
+
+
+
+
+#endif

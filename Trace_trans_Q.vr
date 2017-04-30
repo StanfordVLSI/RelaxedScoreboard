@@ -1,0 +1,317 @@
+#ifndef INC_TRACE_TRANS_Q
+#define INC_TRACE_TRANS_Q
+
+//////////////////////////////////////////////////////////////////////////////
+// File name: Trace_trans_Q.vr
+//
+// This file contains a wrapper around a queue of Trace_trans, in order
+// to allow having an associative array of them to make using the Scoreboard
+// more efficient.
+//////////////////////////////////////////////////////////////////////////////
+
+//------------------------------------------------------------------------------
+//----- Include Related Files Here
+//------------------------------------------------------------------------------
+// Main source file for tile testbench
+
+#include "generic_trans.vrh"
+#include "Trace_trans.vrh"
+#include "Quad_def.vrh"
+#include "generic_master.vrh"
+#include "generic_memory.vrh"
+
+// declare external tasks/classes/functions here if necessary
+
+//------------------------------------------------------------------------------
+//----- Place Special Definitions Here
+//------------------------------------------------------------------------------
+extern generic_memory MainMem;
+
+// --- Some of the definitions are placed in FromTheVerilog_defs.vrh
+
+//------------------------------------------------------------------------------
+//----- Place Auxiliary Classes Here
+//------------------------------------------------------------------------------
+class Trace_trans_Q 
+{
+
+  integer _DEBUG_;
+  Trace_trans ttQ[$];
+  integer num_procs;
+  integer locks[*];
+  
+  bit[63:0] _possiblyFullStarts[$];
+  bit[63:0] _possiblyFullEnds[$];
+  bit[63:0] _possiblyEmptyStarts[$];
+  bit[63:0] _possiblyEmptyEnds[$];
+  
+  bit _has_been_loaded;
+  bit[7:0] _has_been_read_by;
+  bit[63:0] _min_time_read;
+
+  
+  // Constructor 
+  //-------------
+  task new(integer _DEBUG, bit [31:0] addr, Trace_trans initial, integer num_procs);
+
+  task push_front(Trace_trans t){ ttQ.push_front(t);}
+  task push_back(Trace_trans t){ ttQ.push_back(t);}
+  task delete(integer i){ttQ.delete(i);}
+  function Trace_trans pop_front(){ pop_front = ttQ.pop_front();}
+  function Trace_trans front(){front = ttQ[0];}
+  function Trace_trans pop_back(){ pop_back = ttQ.pop_back();}
+  function Trace_trans at(integer idx){ at = ttQ[idx];}
+  function integer size(){ size =  ttQ.size();}
+  function integer empty(){ empty =  ttQ.empty();}
+  
+  /*the following are not really used any more*/
+  function bit hasBeenLoaded(){hasBeenLoaded =  _has_been_loaded;}
+  task setHasBeenLoaded(){_has_been_loaded = 1;}
+  task resetHasBeenReadBy();            
+  task   addHasBeenReadBy(integer proc, bit[63:0] startTime);
+  function bit hasBeenReadByAll();
+  function bit[63:0] getMinLastReadTime(){getMinLastReadTime = _min_time_read;}
+  /*end of old functions*/      
+
+  task reset(bit[31:0] addr, Trace_trans initial);
+  task lock(integer senderID);
+  task unlock(integer senderID);
+  function bit isLocked();
+  function bit isLockedFor(integer i);
+  
+  function bit isPossiblyEmptyBetween(bit[63:0] start, bit[63:0] finish);     
+  function bit isPossiblyFullBetween(bit[63:0] start, bit[63:0] finish);
+  task setImpossibleEmptyAfter(bit[63:0] time);
+  task setImpossibleFullAfter(bit[63:0] time);
+  task setPossibleFullBetween(bit[63:0] start, bit[63:0] finish);
+  task setPossibleEmptyBetween(bit[63:0] start, bit[63:0] finish);
+  task cleanUpBefore(bit[63:0] start);
+    
+  task logMeToFile(integer fd);
+}
+//----------------------------------------
+task Trace_trans_Q::new(integer _DEBUG, bit[31:0] addr, Trace_trans initial, integer _num_procs)
+{
+  integer proc;
+  bit[31:0] time;
+  this.push_back(initial);
+  _has_been_loaded = 0;
+  num_procs = _num_procs;
+  locks = new[num_procs];
+  for (proc = 0; proc < num_procs; proc++){
+    locks[proc] = 0;
+  }
+  
+  /*Playing around with FULL/EMPTY bit*/
+  /*only keep track of this on a word-basis, so don't need
+   * to do this for every byte.
+   */
+  if (addr[1:0] == 0){
+    time = 0;
+    _possiblyFullStarts.push_back(time);
+    _possiblyEmptyStarts.push_back(time);
+    time = INFINITY;
+    _possiblyFullEnds.push_back(time);
+    _possiblyEmptyEnds.push_back(time);
+  }
+}
+
+//----------------------------------------
+task Trace_trans_Q::reset(bit[31:0] addr, Trace_trans initial)
+{
+  bit[63:0] time;
+  integer proc;
+  /*in reset, scoreboard should plant the initial*/
+  ttQ.delete();
+  this.push_back(initial);
+  _has_been_loaded = 0;
+  for (proc = 0; proc < num_procs; proc++){
+    locks[proc] = 0;
+  }
+  /*Playing around with FULL/EMPTY bit*/
+  /*only keep track of this on a word-basis, so don't need
+   * to do this for every byte.
+   */
+  if (addr[1:0] == 0){
+    time = 0;
+    _possiblyFullStarts.push_back(time);
+    _possiblyEmptyStarts.push_back(time);
+    time = INFINITY;
+    _possiblyFullEnds.push_back(time);
+    _possiblyEmptyEnds.push_back(time);
+  }
+}
+
+task Trace_trans_Q::lock(integer senderID){
+  locks[senderID] = locks[senderID] + 1;
+}
+task Trace_trans_Q::unlock(integer senderID){
+  locks[senderID] = locks[senderID] -1;
+}
+
+function bit Trace_trans_Q::isLocked(){
+  integer id;
+  isLocked = 0;
+  for (id = 0; id < num_procs; id++){
+    if (locks[id] > 0 ){
+      isLocked = 1;
+      return;
+    }
+  }
+  return;
+}
+
+function bit Trace_trans_Q::isLockedFor(integer i){
+  isLockedFor = 0;
+  if (locks[i] > 0 ){
+    isLockedFor = 1;
+  }
+  return;
+}
+
+/*FUNCTIONS FOR EXPERIMENTING WITH F/E BITS*/
+
+/*should only be called on word-addresses*/
+function bit Trace_trans_Q::isPossiblyEmptyBetween(bit[63:0] start, bit[63:0] finish){
+  integer num_blocks = _possiblyEmptyStarts.size();
+  integer block;
+  for (block = 0; block< num_blocks; block++){
+    if ((_possiblyEmptyStarts[block] > finish) || (_possiblyEmptyEnds[block] < start)){
+      /*not possible because of THIS block*/
+      continue;
+    }
+    /*this block makes it possible.*/
+    isPossiblyEmptyBetween = 1;
+    return;
+  }
+  isPossiblyEmptyBetween = 0;
+  return;
+}
+
+function bit Trace_trans_Q::isPossiblyFullBetween(bit[63:0] start, bit[63:0] finish){
+  integer num_blocks = _possiblyFullStarts.size();
+  integer block;
+  for (block = 0; block< num_blocks; block++){
+    if ((_possiblyFullStarts[block] > finish) || (_possiblyFullEnds[block] < start)){
+      /*not possible because of THIS block*/
+      continue; 
+    }
+    /*this block makes it possible.*/
+    isPossiblyFullBetween = 1;
+    return;
+  }
+  isPossiblyFullBetween = 0;
+  return;
+}
+
+task Trace_trans_Q::setImpossibleEmptyAfter(bit[63:0] time){
+  integer block;
+  for (block = 0; block < _possiblyEmptyStarts.size(); block++){
+    if (_possiblyEmptyStarts[block] > time){
+      /*remove the block*/
+      _possiblyEmptyStarts.delete(block);
+      _possiblyEmptyEnds.delete(block);
+      block--;
+    }
+    else if (_possiblyEmptyEnds[block] > time){
+      _possiblyEmptyEnds[block] = time;
+    }
+  }
+}
+
+task Trace_trans_Q::setImpossibleFullAfter(bit[63:0] time){
+  integer block;
+  for (block = 0; block < _possiblyFullStarts.size(); block++){
+    if (_possiblyFullStarts[block] > time){
+      /*remove the block*/
+      _possiblyFullStarts.delete(block);
+      _possiblyFullEnds.delete(block);
+      block--;
+    }
+    else if (_possiblyFullEnds[block] > time){
+      _possiblyFullEnds[block] = time;
+    }
+  }
+  
+}
+ 
+task Trace_trans_Q::setPossibleFullBetween(bit[63:0] start, bit[63:0] finish){
+  _possiblyFullStarts.push_back(start);
+  _possiblyFullEnds.push_back(finish);
+} 
+
+task Trace_trans_Q::setPossibleEmptyBetween(bit[63:0] start, bit[63:0] finish){
+  _possiblyEmptyStarts.push_back(start);
+  _possiblyEmptyEnds.push_back(finish);
+}
+
+task Trace_trans_Q::cleanUpBefore(bit[63:0] start){
+  integer block;
+  if (_DEBUG_){
+    printf("Cleaning up F/E status... %d p. full, %d p. empty\n",
+           _possiblyFullStarts.size(), _possiblyEmptyStarts.size());
+  }
+  for (block = 0; block < _possiblyFullStarts.size(); block++){
+    if (_possiblyFullEnds[block] < start){
+      /*remove the block*/
+      _possiblyFullStarts.delete(block);
+      _possiblyFullEnds.delete(block);
+      block--;
+    }
+  }
+  for (block = 0; block < _possiblyEmptyStarts.size(); block++){
+    if (_possiblyEmptyEnds[block] < start){
+      /*remove the block*/
+      _possiblyEmptyStarts.delete(block);
+      _possiblyEmptyEnds.delete(block);
+      block--;
+    }
+  }
+  if (_DEBUG_){
+    printf("Afterwards, F/E status... %d p. full, %d p. empty\n",
+           _possiblyFullStarts.size(), _possiblyEmptyStarts.size());
+  }   
+  
+}
+
+
+/*UNUSED*/
+task Trace_trans_Q::resetHasBeenReadBy(){
+  _has_been_read_by = 0;
+  _min_time_read = INFINITY;
+}
+
+/*UNUSED*/
+task Trace_trans_Q::addHasBeenReadBy(integer proc, bit[63:0] startTime){
+  if (proc > 7 || proc < 0){
+    return;
+  }
+  _has_been_read_by  = _has_been_read_by| 8'h1<<proc;
+  _min_time_read = _min_time_read < startTime?_min_time_read:startTime;
+}
+
+/*UNUSED*/
+function bit Trace_trans_Q::hasBeenReadByAll(){
+  hasBeenReadByAll =( _has_been_read_by == 8'hff);
+}
+
+task Trace_trans_Q::logMeToFile(integer fd=0){
+  if (fd == 0){
+    return;
+  }
+  else{ 
+    integer jdx;
+    fprintf(fd,
+            "|ID      |TCreated|Sndr|Op   |Addr    |D |Start   |End     |T|Value is   |Comment\n"
+            "|        |        | ID |code |        |a |Time    |Time    |C|Valid Until|\n"
+            "|        |        |    |     |        |t |        |        |C|Cycle  N   |\n"
+            "|        |        |    |     |        |a |        |        | |(per cpu ) |\n"
+            "|--------|--------|----|-----|--------|--|--------|--------|-|---------|\n");
+           //|8       |8       |4   |5    |8       |2 |8       |8       |1| up to 80   |
+    for (jdx = ttQ.size()-1; jdx >= 0 ; jdx --){
+      //fprintf(fd, "[%8d]: ", jdx);
+      ttQ[jdx].LogMeToFile(fd);
+    }
+  }
+}
+#endif

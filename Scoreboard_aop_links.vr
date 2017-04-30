@@ -1,0 +1,621 @@
+/*************************************************************************
+ ** From Perforce:
+ **
+ ** $Id: //Smart_design/Smash_rel/TestCommonLib/Quad/Scoreboard_aop_links.vr#3 $ID$
+ ** $DateTime: 2008/05/31 21:23:45 $
+ ** $Change: 6806 $
+ ** $Author: shacham $
+ *************************************************************************/
+
+/*************************************************************************
+ * File name: Scoreboard_aop_links.vr
+ *              (as in ProcessorTrace to Scoreboard aspect oriented link,
+ *               MainMem to Scoreboard aspect oriented link, etc.)
+ *
+ * This file contains an aspect oriented extensions. The purpuse of this
+ * code is to link the scoreboard and the  monitors, by using the
+ * Scoreboard interface methods.
+ *
+ * Index:
+ * 1. Extensions to ProcessorTraceMonitor
+ * 2. Extensions to generic_memory
+ * 3.
+ *************************************************************************/
+#ifndef INC_SCOREBOARD_AOP_LINKS
+#define INC_SCOREBOARD_AOP_LINKS
+
+
+//------------------------------------------------------------------------------
+//----- Include Related Files Here
+//------------------------------------------------------------------------------
+// Main source file for quad testbench
+#include <vera_defines.vrh>
+#include <VeraErrorHandler.vrh>
+
+
+// Global definitions
+#include "Quad_def.vrh"
+#include "TIE_ops.vrh"
+#include "ProcessorTrace.port.vrh"
+
+
+// declare external tasks/classes/functions here if necessary
+#include "generic_trans.vrh"
+#include "generic_master.vrh"
+#include "Trace_trans.vrh"
+#include "Trace_trans_Q.vrh"
+#include "ProcessorTrace.vrh"
+#include "sim_io.vrh"
+#include "generic_master.vrh"
+#include "generic_memory.vrh"
+#include "Scoreboard_Address.vrh"
+#include "TCC_Transaction.vrh"
+#include "Store_Queue.vrh"
+#include "Scoreboard.vrh"
+
+
+extern Scoreboard scoreboard;
+extern ProcessorTrace_IF_port ProcTrace_Ports_arr[*];
+extern integer _DEBUG_;
+
+/*******************************************************************************
+ *
+ * 1. Extensions to ProcessorTraceMonitor
+ *
+ ******************************************************************************/
+
+//------------------------------------------------------------------------------
+//----- Place Main Class Extension Here
+//------------------------------------------------------------------------------
+
+extends ProcTraceLink2SB(ProcessorTraceMonitor)
+{
+  /*****************************************************************************
+   * Add class members here
+   ****************************************************************************/
+  bit[63:0] prev_global_cycle, prev_prev_global_cycle, prev_prev_prev_global_cycle;
+
+  /*keep track of the address for a load returning 2 cycles later*/
+  bit [31:0] prev_addr;
+  bit [31:0] prev_prev_addr;
+
+  Trace_trans saved_synch_trans[4];
+
+  /*****************************************************************************
+   * Initial additional variables here
+   ****************************************************************************/
+   after task new(string file_prefix_,
+           string LocalActivationCommand_, integer tile, integer cpu)
+  {
+     integer idx;
+     prev_global_cycle = 0;
+     prev_prev_global_cycle = 0;
+     prev_prev_prev_global_cycle = 0;
+     for (idx = 0; idx < 4; idx++){
+       saved_synch_trans[idx] = null;
+     }
+   }
+
+  /*****************************************************************************
+   * Send transactions that were collected by CollectSingleDramTrace
+   ****************************************************************************/
+  after task CollectSingleDramTrace( integer fd )
+  {
+    Trace_trans dram_wr_trans, dram_rd_trans;
+    integer idx=0;
+
+      
+    // keep track of the global time for the cpu local clock ticks
+    // (This task is called every local cpu clock. Therefore, in order to
+    // reme,mber the global time, that corospond with the cpu clock, I keep
+    // these two variables.)
+    prev_prev_prev_global_cycle = prev_prev_global_cycle;
+    prev_prev_global_cycle = prev_global_cycle;
+    prev_global_cycle = get_cycle();
+
+
+    
+    // check for write transactions
+    //--------------------------------
+    if ( ( ProcTrace_Ports_arr[my_ID].$BReset === 1'b0 ) &&
+         ( ProcTrace_Ports_arr[my_ID].$DRam0En0 === 1'b1 ) &&
+         ( ProcTrace_Ports_arr[my_ID].$DRam0Wr0 === 1'b1 ))
+    {
+      bit [31:0] addr = { 1'b1, ProcTrace_Ports_arr[my_ID].$DRam0Addr0, 2'b0};
+      bit [3:0] byte_mask = ProcTrace_Ports_arr[my_ID].$DRam0ByteEn0;
+      bit [31:0] data = ProcTrace_Ports_arr[my_ID].$DRam0WrData0;
+
+
+      //for every byte, create a scoreboard transaction
+      for (idx=0;idx<4;idx++)
+      {
+        if (byte_mask[idx])
+        {
+          dram_wr_trans = scoreboard.getNewTraceTrans();
+          //AssignValues(Cpu, Tile, dest_Addr, data, byteMask,
+          //timeStart, timeEnd, op, comment = "")
+          dram_wr_trans.AssignValues(8*my_quadID + 2*my_tileID+my_cpuID,
+                                     addr + idx,
+                                     data[(7+8*idx):(8*idx)],
+                                     get_cycle(), INFINITY, S_STORE,
+                                     "(By Data Trace Monitor)");
+          scoreboard.AddTransToSB(dram_wr_trans);
+          if (_DEBUG_)
+            printf("t=%d: DEBUG: AddTransToSB(dram_wr_trans)\n",get_cycle());
+
+        }
+      }
+
+    
+      
+    }     
+
+    
+    
+    // check for read transactions
+    //--------------------------------
+    //check for start of read transactions:
+    if (( ProcTrace_Ports_arr[my_ID].$BReset === 1'b0) &&
+        ( ProcTrace_Ports_arr[my_ID].$DRam0En0 === 1'b1 ) &&
+        ( ProcTrace_Ports_arr[my_ID].$DRam0Wr0 === 1'b0 ))
+    {
+      for (idx = 0; idx < 4; idx++){
+        scoreboard.LockAddress(8*my_quadID + 2*my_tileID+my_cpuID,
+                               { 1'b1,
+                                ProcTrace_Ports_arr[my_ID].$DRam0Addr0,
+                                2'b0} + idx, S_LOAD );
+      }
+    }
+    if ( ( ProcTrace_Ports_arr[my_ID].$BReset.2 === 1'b0 ) &&
+         ( ProcTrace_Ports_arr[my_ID].$DRam0En0.2 === 1'b1 ) &&
+         ( ProcTrace_Ports_arr[my_ID].$DRam0Wr0.2 === 1'b0 ))
+    {
+      bit [31:0] addr = { 1'b1, ProcTrace_Ports_arr[my_ID].$DRam0Addr0.2, 2'b0};
+      bit [31:0] data = ProcTrace_Ports_arr[my_ID].$DRam0Data0;
+
+
+      for (idx=0;idx<4;idx++)
+      {
+        dram_rd_trans = scoreboard.getNewTraceTrans();
+      
+        // AssignValues(senderID, dest_Addr,
+        //              data, byteMask, timeStart, timeEnd, op)
+        dram_rd_trans.AssignValues(8*my_quadID + 2*my_tileID+my_cpuID,
+                                   addr + idx,
+                                   data[(7+8*idx):(8*idx)],
+                                   prev_prev_prev_global_cycle, get_cycle(),
+                                   S_LOAD, "(By Data Trace Monitor)");
+        scoreboard.AddTransToSB(dram_rd_trans);
+        if (_DEBUG_)
+          printf("t=%d: DEBUG: AddTransToSB(dram_rd_trans)\n",get_cycle());
+        scoreboard.UnlockAddress(8*my_quadID + 2*my_tileID+my_cpuID,addr + idx, S_LOAD);
+      }
+      
+    }    
+  }
+
+  /*****************************************************************************
+   * Send transactions that were collected by CollectSingleIramTrace
+   ****************************************************************************/
+  after task CollectSingleIramTrace( integer fd )
+  {
+    Trace_trans iram_wr_trans, iram_rd_trans;
+    integer idx=0;
+    
+    if (_DEBUG_  > 20){
+      if ( ( ProcTrace_Ports_arr[my_ID].$BReset === 1'b0 ) &&
+          ( ProcTrace_Ports_arr[my_ID].$IRam0En === 1'b1 ) &&
+          ( ProcTrace_Ports_arr[my_ID].$IRam0Wr === 1'b1 ))
+      {
+        bit [31:0] addr = { 2'b01, ProcTrace_Ports_arr[my_ID].$IRam0Addr, 3'b0};
+        bit [31:0] data = 32'hbad00bad;
+        if (ProcTrace_Ports_arr[my_ID].$IRam0WordEn[1])
+        {
+          data = ProcTrace_Ports_arr[my_ID].$IRam0WrData[63:32];
+          addr += 4;
+        }
+        if (ProcTrace_Ports_arr[my_ID].$IRam0WordEn[0])
+        {      
+          data = ProcTrace_Ports_arr[my_ID].$IRam0WrData[31:0];
+        }
+        printf("%d: Store from %d of 0x%h to addr 0x%h\n", get_cycle(), my_ID, data, addr);
+      }
+    }
+          
+        
+    
+    // check for write transactions. For writes, we ignore busy signal execpt at
+    // present. This means write could get started sooner than they should, but
+    // this should be OK.
+    //--------------------------------
+    if ( ( ProcTrace_Ports_arr[my_ID].$BReset === 1'b0 ) &&
+         ( ProcTrace_Ports_arr[my_ID].$IRam0En === 1'b1 ) &&
+         ( ProcTrace_Ports_arr[my_ID].$IRam0Wr === 1'b1 ) &&
+         ( ProcTrace_Ports_arr[my_ID].$IRam0Busy === 1'b0))       
+    {
+      bit [31:0] addr = { 2'b01, ProcTrace_Ports_arr[my_ID].$IRam0Addr, 3'b0};
+      bit [31:0] data = 32'hbad00bad;
+      
+      if (ProcTrace_Ports_arr[my_ID].$IRam0WordEn[1])
+      {
+        data = ProcTrace_Ports_arr[my_ID].$IRam0WrData[63:32];
+        addr += 4;
+      }
+      if (ProcTrace_Ports_arr[my_ID].$IRam0WordEn[0])
+      {      
+        data = ProcTrace_Ports_arr[my_ID].$IRam0WrData[31:0];
+      }
+      
+      for (idx=0;idx<4;idx++)
+      {   
+        iram_wr_trans = scoreboard.getNewTraceTrans();
+        //            AssignValues(senderID, dest_Addr, data,
+        //                      byteMask, timeStart, timeEnd, op)
+        iram_wr_trans.AssignValues(8*my_quadID + 2*my_tileID+my_cpuID,
+                                   addr + idx,
+                                   data[(7+8*idx):(8*idx)],
+                                   prev_global_cycle, INFINITY, S_STORE,
+                                   "(By Inst Trace Monitor)");
+        scoreboard.AddTransToSB(iram_wr_trans);
+        if (_DEBUG_){
+          printf("t=%d: DEBUG: AddTransToSB(iram_wr_trans)\n",get_cycle());
+          iram_wr_trans.PrintMe();
+        }
+      }
+    }
+    
+    // check for read transactions
+    //--------------------------------
+    if (( ProcTrace_Ports_arr[my_ID].$BReset === 1'b0) &&
+        ( ProcTrace_Ports_arr[my_ID].$IRam0En === 1'b1 ) &&
+        ( ProcTrace_Ports_arr[my_ID].$IRam0Wr === 1'b0 ))
+    {
+      
+      for (idx = 0; idx < 8; idx++){
+        scoreboard.LockAddress(8*my_quadID + 2*my_tileID+my_cpuID,
+                               { 2'b01,
+                                ProcTrace_Ports_arr[my_ID].$IRam0Addr,
+                                3'b0} + idx, S_LOAD);
+      }
+    }
+    
+    if (( ProcTrace_Ports_arr[my_ID].$BReset.2 === 1'b0 ) &&
+        ( ProcTrace_Ports_arr[my_ID].$IRam0En.2 === 1'b1 ) &&
+        ( ProcTrace_Ports_arr[my_ID].$IRam0Wr.2 === 1'b0 ) &&
+        ( ProcTrace_Ports_arr[my_ID].$IRam0Busy.1 === 1'b0))
+    {
+      bit [31:0] addr = { 2'b01, ProcTrace_Ports_arr[my_ID].$IRam0Addr.2, 3'b0};
+      bit [63:0] data = ProcTrace_Ports_arr[my_ID].$IRam0Data;
+      
+      for (idx=0;idx<8;idx++)
+      {   
+        iram_rd_trans = scoreboard.getNewTraceTrans();
+      
+        //            AssignValues(senderID, dest_Addr,
+        //                         data, byteMask, timeStart, timeEnd, op)
+        iram_rd_trans.AssignValues(8*my_quadID + 2*my_tileID+my_cpuID,
+                                   addr + idx,
+                                   data[(7+8*idx):(8*idx)],
+                                   prev_prev_prev_global_cycle, get_cycle(),
+                                   S_LOAD, "(By Inst Trace Monitor)");
+        scoreboard.AddTransToSB(iram_rd_trans);
+
+        scoreboard.UnlockAddress(8*my_quadID + 2*my_tileID+my_cpuID,
+                                 addr + idx, S_LOAD);
+        if (_DEBUG_)
+          printf("t=%d: DEBUG: AddTransToSB(iram_rd_trans)\n",get_cycle());
+      }
+    }    
+  }
+
+  /*****************************************************************************
+   * Send transactions that were collected by CollectSingleTpTrace
+   ****************************************************************************/
+  after task CollectSingleTpTrace( integer fd )
+  {
+    // collect and send trans to scoreboard here
+  }
+
+
+  /*****************************************************************************
+   * Send transactions that were collected by CollectSingleTieTrace
+   ****************************************************************************/
+  after task CollectSingleTieTrace( integer fd )
+  {
+    //HANDLE TIE LOADS HERE
+    Trace_trans tie_rd_trans, tie_wr_trans;
+    integer idx;
+    bit [69:0] prevMemOp_Out = ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out.2;
+    bit [5:0]  prevOpCode    = prevMemOp_Out[69:64];
+    bit [5:0] currOpCode = ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out[69:64];
+    // First, check for data returned by LSU
+    /*check for starts of reads*/
+    if( (ProcTrace_Ports_arr[my_ID].$BReset === 1'b0)
+       && (ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out_Req === 1'b1) && 
+       ( ( currOpCode === SYNCH_LOAD )
+        || ( currOpCode === FUTURE_LOAD )
+        || (currOpCode === RAW_LOAD)
+        ||( currOpCode === RESET_LOAD )
+        ))
+    {
+      for (idx = 0; idx < 4; idx ++){
+        scoreboard.LockAddress(8*my_quadID + 2*my_tileID+my_cpuID,
+                               ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out[31:0] + idx,
+                               currOpCode);
+      }
+    }
+    
+    if( (ProcTrace_Ports_arr[my_ID].$BReset.2 === 1'b0)
+       && (ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out_Req.2 === 1'b1) && 
+       ( ( prevOpCode === SYNCH_LOAD )
+        || ( prevOpCode === FUTURE_LOAD )
+        || (prevOpCode === RAW_LOAD)
+        ||( prevOpCode === RESET_LOAD )
+        //|| ( prevOpCode === META_LOAD )  
+        //||( prevOpCode === RAW_META_LOAD ) 
+        //||( prevOpCode === FIFO_LOAD )
+        //||  ( prevOpCode === SPEC_REG_READ )
+        //|| ( prevOpCode === SAFE_LOAD ) 
+        //||( prevOpCode === TEST_SET )
+        //|| ( prevOpCode === TEST_RESET )
+      ))
+  {
+
+    bit [31:0] addr = prevMemOp_Out[31:0];
+    bit [31:0] data = ProcTrace_Ports_arr[my_ID].$TIE_MemOp_In;
+    
+    for (idx=0;idx<4;idx++)
+    {
+      tie_rd_trans = scoreboard.getNewTraceTrans();
+      
+      //            AssignValues(senderID, dest_Addr,
+      //                     data, byteMask, timeStart, timeEnd, op)
+      tie_rd_trans.AssignValues(8*my_quadID + 2*my_tileID+my_cpuID,
+                                addr + idx,
+                                data[(7+8*idx):(8*idx)],
+                                prev_prev_prev_global_cycle, get_cycle(),
+                                prevOpCode, "(By TIE Trace Monitor)");
+      scoreboard.AddTransToSB(tie_rd_trans);
+      if (_DEBUG_)
+        printf("t=%d: DEBUG: AddTransToSB(tie_rd_trans)\n",get_cycle());
+      scoreboard.UnlockAddress(8*my_quadID + 2*my_tileID+my_cpuID,
+                             addr + idx, prevOpCode);
+      
+    }
+    
+    }
+    
+
+    //HANDLE TIE STORES COMPLETION HERE
+    //FOR SYNCH Ops, we care about the cycle before, because
+    // they are guaranteed to be completed when the clock
+    // ticks again. 
+    
+  if( ProcTrace_Ports_arr[my_ID].$BReset.2 === 1'b0)
+  {
+    if( ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out_Req.2 === 1'b1 )
+    {
+      bit [69:0] MemOp_Out = ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out.2;
+            
+      if( MemOp_Out[69:64] === SYNCH_STORE
+         || MemOp_Out[69:64] === SET_STORE
+         ){
+        bit [31:0] addr = MemOp_Out[31:0];
+        bit [31:0] data = MemOp_Out[63:32];
+        //for every byte, create a scoreboard transaction
+        for (idx=0;idx<4;idx++)
+        {
+          tie_wr_trans = saved_synch_trans[idx];
+          tie_wr_trans.timeEnd = get_cycle();
+          scoreboard.CompleteTransInSB(tie_wr_trans);
+          saved_synch_trans[idx] = null;
+        } 
+      }/*if its a store the sb saw 2 cycles ago and can handle right now*/
+    } /*if is's a store from 2 cycles ago*/
+  }/*not in reset*/
+
+
+    
+  //HANDLE TIE SYNCH STORES BEGINNING HERE
+  //FOR SYNCH Ops, we care about the cycle before, because
+  // they are guaranteed to be completed when the clock
+    // ticks again. This makes little difference for raw stores, I THINK,
+  // since they are non-blocking.
+  // TODO: make this more special-cased.
+  if( ProcTrace_Ports_arr[my_ID].$BReset === 1'b0)
+  {
+    if( ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out_Req === 1'b1 )
+    {
+      bit [69:0] MemOp_Out = ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out;
+      
+      if( MemOp_Out[69:64] === SYNCH_STORE
+         || MemOp_Out[69:64] === SET_STORE
+         //|| MemOp_Out[69:64] === RAW_STORE /*we handle this down below*/
+         //|| MemOp_Out[69:64] === RAW_META_STORE
+         //|| MemOp_Out[69:64] === FIFO_STORE
+         //|| MemOp_Out[69:64] === CACHE_GANG_WRITE
+         //|| MemOp_Out[69:64] === CACHE_COND_GANG_WRITE
+         //|| MemOp_Out[69:64] === MAT_GANG_WRITE
+         //|| MemOp_Out[69:64] === MAT_COND_GANG_WRITEx
+         //|| MemOp_Out[69:64] === SPEC_REG_WRITE
+         //|| MemOp_Out[69:64] === META_STORE
+
+         ){
+
+        bit [31:0] addr = MemOp_Out[31:0];
+        bit [31:0] data = MemOp_Out[63:32];
+        //for every byte, create a scoreboard transaction
+        for (idx=0;idx<4;idx++)
+        {
+                
+          tie_wr_trans = scoreboard.getNewTraceTrans();
+        
+          //            AssignValues(Cpu, Tile, dest_Addr,
+          // data, byteMask, timeStart, timeEnd, op, comment = "")
+          tie_wr_trans.AssignValues(8*my_quadID + 2*my_tileID+my_cpuID,
+                                    addr + idx,
+                                    data[(7+8*idx):(8*idx)],
+                                    get_cycle(),
+                                    INFINITY, MemOp_Out[69:64],
+                                    "(By TIE Trace Monitor)");
+          scoreboard.AddTransToSB(tie_wr_trans);
+          if (_DEBUG_)
+            printf("t=%d: DEBUG: AddTransToSB(tie_wr_trans)\n",get_cycle());
+          if (MemOp_Out[69:64] === SYNCH_STORE
+              || MemOp_Out[69:64] === SET_STORE){
+            if (saved_synch_trans[idx] != null){
+              printf("INTERNAL SCOREBOARD ERROR... saved_synch_trans wasn't null. idx = %d, my_id = %d \n",
+                     idx, 8*my_quadID + 2*my_tileID + my_cpuID);
+              exit(1);
+            }
+            saved_synch_trans[idx] = tie_wr_trans;
+          }     
+        }
+      }/*if its a store the sb can handle right now*/
+    } /*if is's a store*/
+
+    //HANDLE TIE RAW STORES BEGINNING HERE
+    //also, handle SPEC_CMD which will be used to indicate
+    // TCC xactions
+    // TODO: make this more special-cased.
+    if( ProcTrace_Ports_arr[my_ID].$BReset === 1'b0)
+    {
+      if( ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out_Req === 1'b1 )
+      {
+        bit [69:0] MemOp_Out = ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out;
+            
+        if(
+          MemOp_Out[69:64] === RAW_STORE
+          ){
+
+          bit [31:0] addr = MemOp_Out[31:0];
+          bit [31:0] data = MemOp_Out[63:32];
+      //for every byte, create a scoreboard transaction
+      for (idx=0;idx<4;idx++)
+      {
+        tie_wr_trans = scoreboard.getNewTraceTrans();
+        
+        //            AssignValues(Cpu, Tile, dest_Addr,
+        // data, byteMask, timeStart, timeEnd, op, comment = "")
+          tie_wr_trans.AssignValues(8*my_quadID + 2*my_tileID+my_cpuID,
+                                     addr + idx,
+                                     data[(7+8*idx):(8*idx)],
+                                     get_cycle(),
+                                     INFINITY, MemOp_Out[69:64],
+                                     "(By TIE Trace Monitor)");
+          scoreboard.AddTransToSB(tie_wr_trans);
+          if (_DEBUG_)
+            printf("t=%d: DEBUG: AddTransToSB(tie_wr_trans)\n",get_cycle());
+      
+      }
+        }/*if its a raw store the sb can handle right now*/
+      } /*if is's a store*/
+    }
+  }
+
+   
+    //also, handle SPEC_CMD which will be used to indicate
+    // TCC xactions
+  if( ProcTrace_Ports_arr[my_ID].$BReset === 1'b0)
+    {
+      if( ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out_Req === 1'b1 )
+      {
+        bit [69:0] MemOp_Out = ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out;
+            
+        if(MemOp_Out[69:64] === SPEC_CMD){
+          
+          bit [31:0] addr = MemOp_Out[31:0];
+          tie_wr_trans = scoreboard.getNewTraceTrans();
+        
+        //            AssignValues(Cpu, Tile, dest_Addr,
+        // data, byteMask, timeStart, timeEnd, op, comment = "")
+          tie_wr_trans.AssignValues(8*my_quadID + 2*my_tileID+my_cpuID,
+                                    addr,
+                                    0,
+                                    get_cycle(),
+                                    INFINITY, MemOp_Out[69:64],
+                                    "(By TIE Trace Monitor)");
+          scoreboard.AddTransToSB(tie_wr_trans);
+          if (_DEBUG_)
+            printf("t=%d: DEBUG: AddTransToSB(spec_trans)\n",get_cycle());
+          
+        } /*if it's a SPEC_CMD*/
+      } 
+  }
+  
+  
+  //HANDLE MEM_BAR's here.
+    if( (ProcTrace_Ports_arr[my_ID].$BReset.1 === 1'b0) && (ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out_Req.1 === 1'b1)){
+    bit[69:0] bar_prevMemOp_Out = ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out.1;
+    bit[5:0] bar_prevOpCode    = bar_prevMemOp_Out[69:64];
+    if (( bar_prevOpCode === SYNCH_LOAD )
+        || ( bar_prevOpCode === FUTURE_LOAD )
+        ||( bar_prevOpCode === RESET_LOAD ) 
+        || (bar_prevOpCode === SYNCH_STORE)
+        || (bar_prevOpCode === SET_STORE)
+        || (bar_prevOpCode === MEM_BAR))
+    {
+      bit [31:0] bar_addr = bar_prevMemOp_Out[31:0];
+      scoreboard.SetMemBarInSB(get_cycle(), 8*my_quadID + 2*my_tileID + my_cpuID);
+    }  
+  }
+  }
+ 
+}
+/*******************************************************************************
+ *
+ * 2. Extensions to generic_memory
+ *
+ ******************************************************************************/
+
+//------------------------------------------------------------------------------
+//----- Place Main Class Extension Here
+//------------------------------------------------------------------------------
+extends GenericMemLink2SB(generic_memory)
+{
+  /*****************************************************************************
+   * Add class members here
+   ****************************************************************************/
+
+  /*****************************************************************************
+   * Initial additional variables here
+   ****************************************************************************/
+
+  /*****************************************************************************
+   * Send transactions that were written by tester (written_by==BY_TESTER)
+   ****************************************************************************/
+  after task SendWriteToSB(bit [31:0] addr, bit[31:0] data, bit [3:0] byte_mask,
+                           bit [5:0] meta, bit meta_byte_mask)
+  {
+    Trace_trans tester2mem_trans;
+    integer idx=0;
+
+    if (scoreboard == null)
+      return;
+        
+    //for every byte, create a scoreboard transaction
+    for (idx=0;idx<4;idx++)
+    {
+      if (byte_mask[idx])
+      {
+        tester2mem_trans = scoreboard.getNewTraceTrans();
+        
+        // AssignValues(senderID, dest_Addr, data, byteMask, timeStart, timeEnd, op, comment="")
+        tester2mem_trans.AssignValues(my_ID, 
+                                      addr + idx,
+                                      data[(7+8*idx):(8*idx)],
+                                      get_cycle(),
+                                      INFINITY,
+                                      S_STORE,
+                                      "(Tester to Main Memory Write)");
+        scoreboard.AddTransToSB(tester2mem_trans);
+    
+      }
+    }
+
+  
+  }     
+}       
+
+
+#endif

@@ -1,0 +1,3072 @@
+
+/*************************************************************************
+ ** From Perforce:
+ **
+ ** $Id: //Smart_design/Smash_rel/TestCommonLib/Quad/Scoreboard.vr#4 $ID$
+ ** $DateTime: 2008/05/01 00:20:07 $
+ ** $Change: 6703 $
+ ** $Author: zasgar $
+ *************************************************************************/
+#ifndef INC_SCOREBOARD_VR
+#define INC_SCOREBOARD_VR
+
+//////////////////////////////////////////////////////////////////////////////
+// File name: Scoreboard.vr
+//
+// This file includes the Implementation of the Scoreboard,
+// which will eventually use different algorithms to determine
+// whether a series of loads and stores is possibly or probably
+// legal.It will throw an error if not.
+// 
+//////////////////////////////////////////////////////////////////////////////
+
+//------------------------------------------------------------------------------
+//----- Include Related Files Here
+//------------------------------------------------------------------------------
+// Main source file for quad testbench
+#include <vera_defines.vrh>
+#include <VeraErrorHandler.vrh>
+
+
+// define interfaces, and verilog_node here if necessary
+
+#include "Quad_def.vrh"
+#include "QuadTasks.vrh"
+
+// declare external tasks/classes/functions here if necessary
+#include "generic_trans.vrh"
+#include "sim_io.vrh"
+#include "generic_master.vrh"
+#include "generic_memory.vrh"
+#include "Trace_trans.vrh"
+#include "Trace_trans_Q.vrh"
+#include "Scoreboard_Address.vrh"
+#include "tcc_constants.h"
+#include "TCC_Transaction.vrh"
+#include "Store_Queue.vrh"
+
+//------------------------------------------------------------------------------
+//----- Place Special Definitions and Extern Declarations Here
+//------------------------------------------------------------------------------
+extern generic_memory MainMem;
+extern bit InitializationDone;
+
+/*The amount of time we can "assume" that it takes a Store to complete (I will
+  think more carefully about synch stores in the future). We can RAISE this
+  if it causes too many problems, or LOWER it if it doesn't seem to do anything.
+*/
+
+#define DEFAULT_MAX_STORE_TIME 1500
+#define INTERESTING 32'h40000000
+#define CPUS_PER_TILE 2
+//------------------------------------------------------------------------------
+//----- Place Main Class Declaration Here
+//------------------------------------------------------------------------------
+class Scoreboard extends GENERIC_master
+{
+  // control variables
+  //-------------------
+  protected integer active;
+  protected string my_agent_name;
+  protected integer my_agent_ID;
+  protected string my_prefix;
+  protected integer _DEBUG_;
+
+  //Count how many transactions were actually added to the scoreboard.
+  protected integer transaction_counter;
+  
+  protected integer semID; /*semaphore for controlling the scoreboard when adding a trans.*/
+
+
+  // Queues
+  //-----------------------------
+  protected Trace_trans_Q  Trace_Q_Array[];
+  protected Trace_trans_Q Trace_Q_Freelist[$];
+  protected Trace_trans Trace_trans_Freelist[$];
+  protected Scoreboard_Address ignoreAddress;
+  protected Scoreboard_Address tccAddress;
+  protected TCC_Transaction Tcc_Array[*];
+  protected Store_Queue Store_Queues[*];
+  
+  protected bit[8:0] BackupMem[];
+ 
+  // How long until stores can be expected to be completed.
+  protected integer MaxStoreTime;
+  
+  //keep track of the latest time of a transaction
+  //completed by
+  // each processor
+  protected integer last_transaction_time[*];
+
+  //keep track of the minimum last_transaction_time,
+  // this is the "invalidate_time": any transactions
+  // invalid before this can be garbage collected.
+  protected bit[63:0] invalidate_time;
+  
+  // how many CPUS (ie, 8 for single-quad, 32 for 4-quad)
+  protected integer num_cpus;
+  
+  // Handles to log files:
+  //----------------------
+  integer Scoreboard_log_file_handle;
+  integer Scoreboard_usage_file_handle;
+    
+  // Constructor
+  //------------
+  task new(integer _DEBUG, string my_agent_name_,
+         integer my_agent_ID_, string my_prefix_, integer num_cpus);
+
+  // Main Scoreboard Task: add a transaction to the scoreboard. 
+  //--------------------------------------------------------
+  task AddTransToSB(Trace_trans  trac);
+
+  //Lock an address to prevent garbage collection (ie at the start of a load)
+  task LockAddress(integer senderID, bit [31:0] addr, integer operation);
+  task UnlockAddress(integer senderID, bit [31:0] addr, integer operation);
+  
+  //new outside-callable scoreboard task (usually for synch stores, etc, where
+  //you know when they have completed), trace should already be in the
+  // scoreboard.
+
+  task CompleteTransInSB(Trace_trans trac);
+  
+  //New scoreboard task: indicate a mem-bar operation. THis could be done
+  // by sending an entire transaction to the scoreboard, but as mem-bar is a quality
+  // of many operations, and it doesnt make sense to have all the fields as another
+  // transaction, this is done just with a function.
+
+  task SetMemBarInSB(bit[63:0] cycle, integer senderID);
+  
+  // Scoreboard Check Tasks/Functions:
+  //--------------------------------------------------------
+  //wrapper function for performing the check.
+  protected task CheckScoreboard(Trace_trans last_trans, Trace_trans_Q added_to_q);
+
+  //function that performs a check on the queue and returns -1 if
+  // there is an error, as well as printing out an error.
+  function integer CheckLastReceived(Trace_trans last_trans, Trace_trans_Q added_to_q);
+
+  //function for syncops that checks the possibility that the F/E bit
+  // was set as required.
+  function integer CheckLastFullEmpty(Trace_trans sync_trans, Trace_trans_Q added_to_q);
+
+  // Scoreboard Update Tasks/Functions:
+  //----------------------------------------
+  //wrapper function for performing the update.
+  protected task UpdateScoreboard(Trace_trans last_trans, Trace_trans_Q added_to_q);
+  
+  /* function to update the data structures once a second store to the same
+   * address by the same CPU was spoted
+   */
+  protected function integer UpdateSimple(Trace_trans store_trans, Trace_trans_Q added_to_q);
+
+  //function that invalidates earlier stores to an address by a processor
+  // if a value is read that was written by that proc.
+  protected function integer UpdateAfterRead(Trace_trans last_trans, Trace_trans_Q added_to_q);
+
+
+  //function that invalidates stores which have definately already completed,
+  // after some other value is read.
+  function integer UpdateAfterReadForOtherProcs(Trace_trans read_trans,
+                                                Trace_trans_Q added_to_q);
+
+
+  //Add outstanding stores to a supplementary data structure for each processor.
+  // These can be removed from this structure in various ways.
+  function integer UpdateAddToStoreQueue(Trace_trans last_trans);
+
+  
+  //function used for TSO: once a value has definately already completed,
+  //invalidate all earlier stores by the processor TO ALL ADDRESSES. Actually,
+  // no need to INVALIDATE the stores, but simply to mark their completion
+  // times.
+  function integer UpdateAfterReadTSO(Trace_trans read_trans,
+                                         Trace_trans_Q added_to_q);
+
+  
+  //function that simply records the time that this processor's latest
+  // transaction began. Any transactions the processor makes now
+  // will be later than that. This is to
+  // make garbage collection possible.
+  protected function integer UpdateRecordTransTime(Trace_trans last_trans);
+  
+  //function that invalidates stores based on how far in time they occured
+  // from other stores -- 2 stores far apart, the second will definately
+  // win the race.
+  protected function integer UpdateAfterStoreTimeBased(Trace_trans store_trans, Trace_trans_Q added_to_q);
+  
+  //function that invalidates synch stores. Because a synch store is
+  // guaranteed to have already completed, then a second
+  //synch store to the same address will invalidate all earlier
+  //synch stores.
+  protected function integer UpdateAfterSynchStore(Trace_trans store_trans);
+
+  
+    
+  //function that monitors the F/E bit for each word
+  protected function integer UpdateFullEmpty(Trace_trans last_trans, Trace_trans_Q added_to_q);
+  
+  // (UNUSED)function that will record that a read was completed by a processor
+  // at this address at this time. Once all processors have read something
+  // at this time, then we know all invalid stores to this address can be gc'ed.
+  protected function integer UpdateAfterReadGC(Trace_trans last_trans);
+  
+  // function that simply removes the last xaction if it was a read.
+  protected function integer UpdateRemoveRead(Trace_trans last_trans, Trace_trans_Q added_to_q);
+
+  // function that does some violation checks for loads
+  protected function integer UpdateAfterReadTCC(Trace_trans read_trans, Trace_trans_Q added_to_q);
+  
+  //function that updates the TCC state when transactions are added. This means
+  // setting them to be invalid for all but the issuing processor, and
+  // adding them to the processors TCC Transaction structure.
+  protected function integer UpdateTCC(Trace_trans last_trans, Trace_trans_Q added_to_q);
+
+  //function called when a TCC transaction commits successfully and definately.
+  protected function integer UpdateAfterTCCCommit(Trace_trans store_trans);
+  
+  // Auxiliary Tasks/Functions:
+  //----------------------------------------
+
+  //Task to throw an error, rather than crashing all the time.
+  protected task scoreboard_fail();
+
+  //Task that runs in the background doing garbage collection
+  // of old invalid transactions
+  task GarbageCollector();
+ 
+  /* functions for recycling transactions and transaction queues in
+   * order to save time and memory.  
+   * (getNewTraceTrans is public so that the aop links can use this
+   */
+  public function Trace_trans getNewTraceTrans();
+  protected function Trace_trans_Q getNewTraceTransQ(bit[31:0] addr,
+                                                     bit readFromBackup);
+
+  // Task to handle special commands (TCC dummy commands)
+  protected function bit HandleSpecCmd(Trace_trans trac);
+  protected function bit HandleTccStart(Trace_trans specTrans);
+  protected function bit HandleTccCommitStart(Trace_trans specTrans);
+  protected function bit HandleTccCommitEnd(Trace_trans specTrans);
+  protected function bit HandleTccViolation(Trace_trans specTrans);
+  protected function bit HandleTccEnd(Trace_trans specTrans);
+  // Global activation/termination functions:
+  //--------------------------------------------
+  task run();
+  task stop_me();
+}
+
+//------------------------------------------------------------------------------
+//----- Place Implementation of Methods Here
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// Scoreboard::new()
+task Scoreboard::new(integer _DEBUG, string my_agent_name_,
+                      integer my_agent_ID_, string my_prefix_, integer my_num_cpus)
+{
+  //////////////////////////////////////////////////////////
+  // In the common case this method should not be changed //
+  //////////////////////////////////////////////////////////
+
+  Trace_trans Trace_trans_dummy;
+  integer proc;
+  _DEBUG_ = _DEBUG;
+  if ( _DEBUG_ ) printf ("%s: New Scoreboard was created\n",my_agent_name_);
+  active = 0; // initial monitor as not active.
+  my_agent_name = my_agent_name_;
+  my_agent_ID = my_agent_ID_;
+  my_prefix = my_prefix_;
+
+  /*Initialize counter for number of transactions added to sb.*/
+  transaction_counter = 0;
+  
+  if (my_num_cpus <= 0){
+    printf("SCOREBOARD ERROR: Scoreboard can't handle 0 or fewer CPUs\n");
+    active = 0;
+    repeat (2) @(posedge CLOCK);
+    exit(1);
+  }
+
+  num_cpus = my_num_cpus;
+  
+  // Open Scoreboard log file
+  Scoreboard_log_file_handle = fopen({my_prefix, "Scoreboard.log"}, "w");
+  Scoreboard_usage_file_handle = fopen({my_prefix, "Scoreboard_Size.log"}, "w");
+  if (Scoreboard_log_file_handle == 0)
+  {
+      printf("SCOREBOARD ERROR: VERA Can't open %sScoreboard.log for writing\n", my_prefix);
+      active = 0;
+      repeat (2) @(posedge CLOCK);
+      exit(1);
+  }
+  else
+  {
+    fprintf (Scoreboard_log_file_handle,"File: %sScoreboard.log\n", my_prefix);
+    fprintf (Scoreboard_log_file_handle,"********************************\n" );
+    fprintf (Scoreboard_log_file_handle,"\n\n");
+    fprintf (Scoreboard_log_file_handle,
+             "|TransID |Sndr|O    |Addr    |D |Start   |End     |T|Comment\n"
+             "|        | ID |p    |        |a |Time    |Time    |C|\n"
+             "|        |    |c    |        |t |        |        |C|\n"
+             "|        |    |o    |        |a |        |        | |\n"
+             "|        |    |d    |        |  |        |        | |\n"
+             "|        |    |e    |        |  |        |        | |\n"
+             "|        |    |     |        |  |        |        | |\n"
+             "|--------|----|-----|--------|--|--------|--------|-|\n");
+           
+       
+  fflush(Scoreboard_log_file_handle);
+  }
+  
+
+  // initialize the accesses semaphore
+  //                    random semaphore ID, #semaphores, keys per semaphore
+  semID=alloc(SEMAPHORE, 0                 , 1          , 1                  );
+  if (! semID)
+  {
+    printf("SCOREBOARD ERROR: VERA Can't Allocate Semaphores\n");
+    exit (1);
+  }
+
+  //Initialize the trace trans by creating a dummy transaction,
+  // this is to set the ID counter to zero.
+
+  Trace_trans_dummy = new(num_cpus);
+  Trace_trans_dummy.Init();
+
+  /*initialize last transaction times*/
+  last_transaction_time = new[num_cpus];
+  for (proc = 0; proc < num_cpus; proc ++){
+    last_transaction_time[proc] = 0;
+  }
+
+  /*initialize TCC transactions*/
+  Tcc_Array = new[num_cpus/CPUS_PER_TILE];
+  for (proc = 0; proc < num_cpus/CPUS_PER_TILE; proc++){
+    Tcc_Array[proc] = new(_DEBUG, proc);
+  }
+
+  /*Initialize Store Queues*/
+  Store_Queues = new[num_cpus];
+  for (proc = 0; proc < num_cpus; proc++){
+    Store_Queues[proc] = new(_DEBUG);
+  }
+
+  // finally enroll to the masters list
+  EnrollToMastersList(); //defined in GENERIC_master
+}
+//------------------------------------------------------------------------------
+// Scoreboard::run()
+task Scoreboard::run()
+{
+  
+  // Check if scoreboard is  necessary
+  if(get_plus_arg(CHECK, "use_quad_sb"))
+  {
+    active = 1;
+    printf ("%s: Scoreboard was activated\n",my_agent_name);
+
+    if (get_plus_arg(CHECK, "ScoreboardMaxStoreTime=")){
+      MaxStoreTime = get_plus_arg(NUM, "ScoreboardMaxStoreTime=");
+    }
+    else {
+      MaxStoreTime = DEFAULT_MAX_STORE_TIME;
+    }
+    
+    if (get_plus_arg(CHECK, "ScoreboardIgnore=")){
+      string ignoreStr;
+      reg [2047:0] bit_str; //max 256 char
+      string current, remainder;
+      bit[31:0] low;
+      bit[31:0] high;
+      ignoreAddress = new(_DEBUG_, "SCOREBOARD_IGNORE");
+      bit_str = get_plus_arg(STR, "ScoreboardIgnore=");
+      ignoreStr.bittostr(bit_str);
+      while(ignoreStr.match("-")){
+        current = ignoreStr.prematch();
+        low = current.atohex();
+        ignoreStr = ignoreStr.postmatch();
+        if (ignoreStr.match(",")){
+          current = ignoreStr.prematch();
+          high = current.atohex();
+          ignoreAddress.addRange(low,high);
+          ignoreStr = ignoreStr.postmatch();
+        }       
+        else{   
+          current = ignoreStr;
+          high = current.atohex();
+          ignoreAddress.addRange(low,high);
+          break;
+        }
+      }
+      ignoreAddress.logMeToFile(Scoreboard_log_file_handle);
+    }
+    else{
+      ignoreAddress = new(_DEBUG_, "SCOREBOARD_IGNORE");
+      ignoreAddress.addRange(32'h20000000, 32'h2fffffff);
+      ignoreAddress.logMeToFile(Scoreboard_log_file_handle);
+    }
+      
+    if (get_plus_arg(CHECK, "TccCoherent=")){
+      string tccStr;
+      reg [2047:0] bit_str; //max 256 char
+      string current, remainder;
+      bit[31:0] low;
+      bit[31:0] high;
+      tccAddress = new(_DEBUG_, "TCC_RANGE");
+      bit_str = get_plus_arg(STR, "TccCoherent=");
+      tccStr.bittostr(bit_str);
+      while(tccStr.match("-")){
+        current = tccStr.prematch();
+        low = current.atohex();
+        tccStr = tccStr.postmatch();
+        if (tccStr.match(",")){
+          current = tccStr.prematch();
+          high = current.atohex();
+          tccAddress.addRange(low,high);
+          tccStr = tccStr.postmatch();
+        }       
+        else{   
+          current = tccStr;
+          high = current.atohex();
+          tccAddress.addRange(low,high);
+          break;
+        }
+      }
+      tccAddress.logMeToFile(Scoreboard_log_file_handle);
+    }
+    else{
+      tccAddress = new(_DEBUG_, "TCC_RANGE");
+      /*add TCC coherent range*/
+      tccAddress.addRange(32'ha0000000, 32'hafffffff);
+      /*add TCC buffered range*/
+      tccAddress.addRange(32'hd0000000, 32'hdfffffff);
+      tccAddress.logMeToFile(Scoreboard_log_file_handle);
+    }
+      
+    
+    
+    // Start the garbage collection thread
+    fork
+    {  GarbageCollector();  }
+    join none
+    
+  }
+  else{
+    printf ("%s: Scoreboard is idle\n",my_agent_name);
+    active = 0;
+  }     
+  
+}
+
+//------------------------------------------------------------------------------
+// Scoreboard::stop_me()
+task Scoreboard::stop_me()
+{
+  //////////////////////////////////////////////////////////
+  // In the common case this method should not be changed //
+  //////////////////////////////////////////////////////////
+  fprintf(Scoreboard_log_file_handle,
+          "Number of transactions added to sb: %d\n",
+          transaction_counter);
+  if ( _DEBUG_ ) printf ("%s: Scoreboard was terminated\n",my_agent_name);
+  active = 0;
+  fclose (Scoreboard_log_file_handle);
+ }
+
+
+//------------------------------------------------------------------------------
+/* AddTransToSB(Trace_trans trac) -
+ * This is the main function that adds transactions to the scoreboard
+ * and initiate all the checks.
+ *
+ * The task consists of the following stages:
+ * 1. Check validity of input transaction (scoreboard active, trans!=null, etc)
+ * 2. Translate the address and add the transaction to the queue
+ * 3. Start the checking mechanism
+ * 4. Start invalidation of old transactions mechanism
+ */
+task Scoreboard::AddTransToSB(Trace_trans trac)
+{
+  Trace_trans_Q added_to_q;
+  /*****************************************************************************
+   * 1. Check validity of input transaction
+   ****************************************************************************/
+  /*check our active status: do nothing if not active.*/
+  if (active == 0 || InitializationDone == 0){
+    return;
+  }
+
+  /*make sure it is not a null transaction*/
+  if (trac == null){
+    printf(" SCOREBOARD ERROR: Trace_trans trace was NULL in "
+          "call to Scoreboard::AddTransToSB ");
+    exit(1);
+  }
+
+  // If the transaction was valid => lock semaphore:
+  semaphore_get(WAIT, semID, 1);
+
+  
+  /*****************************************************************************
+   * 2. Translate the address and add the transaction to the queue
+   ****************************************************************************/
+  /* translate the address */
+  /* Some cases does not require translation: */
+
+  /*Check the operation. If it is a special command, do
+   * not translate the address
+   */
+  if (trac.operation === SPEC_CMD){
+    bit err = HandleSpecCmd(trac);
+    if (err){
+      //printf("SCOREBOARD ERROR in HandleSpecCmd\n");
+    }
+    //relese semaphore before leaving!!
+    semaphore_put(semID,1);  
+    return;
+  }
+
+  /*check if the address is in the area to be ignored by the scoreboard,
+   *before translation.
+   */
+  if (ignoreAddress != null){
+    if (ignoreAddress.fallsInRange(trac.destinationAddr)){
+      if (trac.operation != SYNCH_STORE && trac.operation != SET_STORE){
+        Trace_trans_Freelist.push_front(trac);
+      }
+      if (_DEBUG_){
+        printf("Ignoring transaction:\n");
+        trac.LogMeToFileShort(stdout);
+      }
+      //relese semaphore before leaving!!
+      semaphore_put(semID,1);  
+      return;
+    }
+  }
+    
+  
+  if (trac.senderID != MAINMEM_ID && trac.senderID != TESTER_ID )
+  {
+    
+    trac.destinationAddr = TranslateAddress(trac.senderID, trac.destinationAddr, trac.operation);
+  }
+
+  /*is there already a queue at this address location?*/
+  if (!assoc_index(CHECK, Trace_Q_Array, trac.destinationAddr))
+  {
+    /*is there a value in the backup memory already?*/
+    if (!assoc_index(CHECK, BackupMem, trac.destinationAddr)){
+         Trace_Q_Array[trac.destinationAddr] =
+      getNewTraceTransQ(trac.destinationAddr,  0);
+    }
+    else{
+      Trace_Q_Array[trac.destinationAddr] =
+    getNewTraceTransQ(trac.destinationAddr,
+                      1);
+    }
+  }
+  
+  Trace_Q_Array[trac.destinationAddr].push_back(trac);
+  added_to_q = Trace_Q_Array[trac.destinationAddr];
+  transaction_counter = transaction_counter + 1;
+  
+  /*****************************************************************************
+   * 3. Start the checking mechanism
+   ****************************************************************************/
+  /*HACK: set the transactional flag here so check can use it.*/
+  if (trac.senderID < num_cpus
+      && Tcc_Array[trac.senderID/CPUS_PER_TILE].valid
+      && tccAddress.fallsInRange(trac.destinationAddr)){
+    trac.transactional = 1;
+  }
+
+  /*log the transaction to the Scoreboard log file*/
+  if (_DEBUG_){
+    trac.LogMeToFileShort(Scoreboard_log_file_handle);
+    if (trac.destinationAddr == INTERESTING){
+      fprintf(Scoreboard_log_file_handle, "INFO: BEFORE UPDATES\n");
+      Trace_Q_Array[trac.destinationAddr].logMeToFile(Scoreboard_log_file_handle);
+    }
+  }
+  
+  CheckScoreboard(trac, added_to_q);
+
+
+  /*****************************************************************************
+   * 4. Start invalidation of old transactions mechanism
+   ****************************************************************************/
+  UpdateScoreboard(trac, added_to_q);
+  
+  if (_DEBUG_ > 15){
+    trac.LogMeToFileShort(Scoreboard_log_file_handle);
+    if (trac.destinationAddr == INTERESTING){
+      fprintf(Scoreboard_log_file_handle, "INFO: AFTER UPDATES\n");
+      Trace_Q_Array[trac.destinationAddr].logMeToFile(Scoreboard_log_file_handle);
+    }   
+  }     
+  // Finally, release semaphore before leaving
+  semaphore_put(semID,1);
+}
+
+
+//Lock an address to prevent garbage collection (ie at the start of a load)
+task Scoreboard::LockAddress(integer senderID, bit [31:0] addr, integer operation){
+
+  /*check our active status: do nothing if not active.*/
+  if (active == 0 || InitializationDone == 0){
+    return;
+  }
+
+  // If the transaction was valid => lock semaphore:
+  //semaphore_get(WAIT, semID, 1);
+
+   /*check if the address is in the area to be ignored by the scoreboard,
+   *before translation.
+   */
+  if (ignoreAddress != null){
+    if (ignoreAddress.fallsInRange(addr)){
+      //relese semaphore before leaving!!
+      //semaphore_put(semID,1);  
+      return;
+    }
+  }
+  
+  /*****************************************************************************
+   * 2. Translate the address and add the transaction to the queue
+   ****************************************************************************/
+  /* translate the address */
+  /* Some cases does not require translation: */
+
+  if (senderID != MAINMEM_ID && senderID != TESTER_ID )
+  {
+    
+    addr = TranslateAddress(senderID, addr, operation);
+  }
+
+  /*is there already a queue at this address location?*/
+  if (!assoc_index(CHECK, Trace_Q_Array, addr))
+  {
+    /*is there a value in the backup memory already?*/
+    if (!assoc_index(CHECK, BackupMem, addr)){
+         Trace_Q_Array[addr] = getNewTraceTransQ(addr,  0);
+    }
+    else{
+      Trace_Q_Array[addr] = getNewTraceTransQ(addr,1);
+    }
+  }
+  
+  Trace_Q_Array[addr].lock(senderID);
+
+}
+
+task Scoreboard::UnlockAddress(integer senderID, bit [31:0] addr, integer operation){
+  
+  /*check our active status: do nothing if not active.*/
+  if (active == 0 || InitializationDone == 0){
+    return;
+  }
+  
+  // If the transaction was valid => lock semaphore:
+  //semaphore_get(WAIT, semID, 1);
+
+  /*check if the address is in the area to be ignored by the scoreboard,
+   *before translation.
+   */
+  if (ignoreAddress != null){
+    if (ignoreAddress.fallsInRange(addr)){
+      //relese semaphore before leaving!!
+      //semaphore_put(semID,1);  
+      return;
+    }
+  }
+  /*****************************************************************************
+   * 2. Translate the address and add the transaction to the queue
+   ****************************************************************************/
+  /* translate the address */
+  /* Some cases does not require translation: */
+
+  if (senderID != MAINMEM_ID && senderID != TESTER_ID )
+  {
+    
+    addr = TranslateAddress(senderID, addr, operation);
+  }
+  
+  /*is there already a queue at this address location?*/
+  if (assoc_index(CHECK, Trace_Q_Array, addr))
+  {
+    Trace_Q_Array[addr].unlock(senderID);
+  }
+
+  
+}
+
+//------------------------------------------------------------------------------
+/* CompleteTransInSB(Trace_trans trac) -
+ * This is an external function, which should be called
+ * for stores which have a known commit time (synchronous stores).
+ * This is necessary because we want to put the store into the
+ * SB as soon as possible, but also want to use the information
+ * we get from knowing when a synch store completes.
+ */
+
+task Scoreboard::CompleteTransInSB(Trace_trans trac){
+  bit UpdateScoreboard_error = 1'b0;
+
+  if (active == 0 ){ //do nothing.
+    return;
+  }
+  /*make sure it is not a null transaction*/
+  if (trac == null){
+    printf(" SCOREBOARD ERROR: Trace_trans trace was NULL in "
+          "call to Scoreboard::CompleteTransInSB ");
+    exit(1);
+  }
+
+  /*currently this is only used for synchronous stores, where
+   * we know when they complete.
+   */
+  if (trac.operation != SYNCH_STORE &&
+      trac.operation != SET_STORE){
+   
+    return;
+  }
+  
+  UpdateScoreboard_error = UpdateAfterSynchStore(trac);
+  
+  if (UpdateScoreboard_error)
+  {
+    printf ("\n\nSCOREBOARD ERROR: t=%d: Scoreboard Error while doing updates in CompleteTransInSB\n", get_cycle());
+
+    if (Scoreboard_log_file_handle)
+    {
+      fprintf(Scoreboard_log_file_handle,"\n\nSCOREBOARD ERROR: t=%d: Scoreboard Error "
+             "while doing updates\n", get_cycle());
+      fprintf(Scoreboard_log_file_handle, " \n\n Current Queue at that Address:\n\n");
+      if (assoc_index(CHECK, Trace_Q_Array, trac.destinationAddr)){
+        Trace_Q_Array[trac.destinationAddr].logMeToFile(Scoreboard_log_file_handle);
+      }           
+    }
+    scoreboard_fail ();
+    return;
+  }
+  
+
+
+}
+
+
+/* SetMemBarInSB: external function which indicates that all earlier stores
+ * for this sender have completed. Iterate over all the scoreboard and set
+ * end times for outstanding stores. Mark any earlier stores invalid immediately.
+ */
+task Scoreboard::SetMemBarInSB(bit[63:0] cycle, integer senderID){
+
+  integer i;
+  integer jdx, idx;
+  integer qidx;
+  if (active == 0){
+    return;
+  }
+  i = 0;
+  
+  semaphore_get(WAIT, semID, 1);     
+  if (_DEBUG_){
+    printf("SetMemBarInSB called at cycle %d for sender %d\n", cycle, senderID);
+    if (Scoreboard_log_file_handle){
+      fprintf(Scoreboard_log_file_handle, "SetMemBarInSB called at cycle %d for sender %d\n", cycle, senderID);
+    }     
+  }
+  
+  foreach(Trace_Q_Array, qidx){
+    Trace_trans_Q q;
+    
+    Trace_trans trac_to_membar;
+    q = Trace_Q_Array[qidx];
+    if (q == null){
+      continue;
+    }
+ 
+    for (jdx = 0; jdx < q.size(); jdx++){
+      bit latest_for_this_sender = 1;
+      trac_to_membar = q.at(jdx);
+        if (trac_to_membar.senderID == senderID){
+          if ((trac_to_membar.operation == S_STORE)
+              ||(trac_to_membar.operation == SYNCH_STORE)
+              ||(trac_to_membar.operation == RAW_STORE)
+              ||(trac_to_membar.operation == SET_STORE)){
+            if ((trac_to_membar.operation == SYNCH_STORE || trac_to_membar.operation == SET_STORE) && trac_to_membar.timeEnd == INFINITY){
+              /*this is a sync-op that is still going, probably the one that caused this membar.*/
+              latest_for_this_sender = 0;
+              continue;
+            }
+            if (trac_to_membar.transactional){
+              latest_for_this_sender = 0;
+              continue;
+            }
+            trac_to_membar.timeEnd = trac_to_membar.timeEnd < cycle? trac_to_membar.timeEnd:cycle;
+            if (latest_for_this_sender){
+              latest_for_this_sender = 0;
+            }
+            else{
+              /*now can be more agrresive about the invalidation time for this, don't need to wait
+               * MaxStoreTime cycles.
+               */
+              for (idx = 0; idx < num_cpus; idx ++){
+                trac_to_membar.is_valid_for_cpu[idx] = (trac_to_membar.is_valid_for_cpu[idx] < cycle?
+                  trac_to_membar.is_valid_for_cpu[idx]:cycle);
+              }
+            }
+          }
+        }
+    }       
+  }
+  
+  semaphore_put(semID, 1);
+}
+  
+  
+  
+//-------------------------------------------------------------------------------
+/* CheckScoreboard:
+ * This task initiate all the checks for the given transaction
+ */
+task Scoreboard::CheckScoreboard(Trace_trans last_trans,
+                                 Trace_trans_Q added_to_q){
+  bit CheckScoreboard_error = 1'b0;
+
+  // Put all checks here in sequence. Each check must return 0 if good, 1 otherwise
+  //-------------------------------------------------------------------------------
+
+  
+  CheckScoreboard_error = CheckScoreboard_error | CheckLastReceived(last_trans, added_to_q);
+  //CheckScoreboard_error = CheckScoreboard_error | CheckLastFullEmpty(last_trans);
+  //CheckScoreboard_error = CheckScoreboard_error | <my_second_check>();
+  //CheckScoreboard_error = CheckScoreboard_error | <my_third_check>();
+
+  
+
+  // Finally, after all checks are done, look at the error bit and initiate an error message
+  //-------------------------------------------------------------------------------
+  if (CheckScoreboard_error)
+  {
+    printf ("\n\nSCOREBOARD ERROR: t=%d: ", get_cycle());
+    last_trans.PrintMeShort();
+    
+    if (Scoreboard_log_file_handle)
+    {
+      fprintf(Scoreboard_log_file_handle,"\n\nSCOREBOARD ERROR: t=%d: Scoreboard Error for "
+             "received transaction:\n", get_cycle());
+      last_trans.LogMeToFileShort(Scoreboard_log_file_handle);
+      fprintf(Scoreboard_log_file_handle, " \n\n Current Queue at that Address:\n\n");
+      if (assoc_index(CHECK, Trace_Q_Array, last_trans.destinationAddr)){
+        Trace_Q_Array[last_trans.destinationAddr].logMeToFile(Scoreboard_log_file_handle);
+      }           
+       scoreboard_fail();
+       return;
+    }        
+  }       
+}
+
+//-------------------------------------------------------------------------------
+/* UpdateScoreboard:
+ * This task initiate all the updates for the scoreboard (i.e. invalidating old
+ * transactions etc).
+ */
+task Scoreboard::UpdateScoreboard(Trace_trans last_trans, Trace_trans_Q added_to_q)
+{
+  bit UpdateScoreboard_error = 1'b0;
+
+  
+  // Put all updates here in sequence. Each update must return 0 if good, 1 otherwise
+  //-------------------------------------------------------------------------------
+
+  UpdateScoreboard_error = UpdateScoreboard_error | UpdateTCC(last_trans, added_to_q);
+  UpdateScoreboard_error = UpdateScoreboard_error | UpdateSimple(last_trans, added_to_q);
+  UpdateScoreboard_error = UpdateScoreboard_error | UpdateAddToStoreQueue(last_trans);
+  UpdateScoreboard_error = UpdateScoreboard_error | UpdateAfterRead(last_trans, added_to_q);
+  UpdateScoreboard_error = UpdateScoreboard_error | UpdateAfterReadForOtherProcs(last_trans, added_to_q);
+  //UpdateScoreboard_error = UpdateScoreboard_error | UpdateAfterReadTSO(last_trans, added_to_q);
+  UpdateScoreboard_error = UpdateScoreboard_error | UpdateRecordTransTime(last_trans);
+  UpdateScoreboard_error = UpdateScoreboard_error | UpdateAfterStoreTimeBased(last_trans, added_to_q);
+  //UpdateScoreboard_error = UpdateScoreboard_error | UpdateAfterSynchStore(last_trans);
+  //UpdateScoreboard_error = UpdateScoreboard_error | UpdateAfterReadTimeBased(last_trans);
+  UpdateScoreboard_error = UpdateScoreboard_error | UpdateAfterReadTCC(last_trans, added_to_q);
+  UpdateScoreboard_error = UpdateScoreboard_error | UpdateFullEmpty(last_trans, added_to_q);
+  UpdateScoreboard_error = UpdateScoreboard_error | UpdateRemoveRead(last_trans, added_to_q);
+  //UpdateScoreboard_error = UpdateScoreboard_error | <my_third_update>();
+
+  
+  // Finally, after all updates are done, look at the error bit and initiate an error message
+  //-------------------------------------------------------------------------------
+  if (UpdateScoreboard_error)
+  {
+    printf ("\n\nSCOREBOARD ERROR: t=%d: Scoreboard Error while doing updates\n", get_cycle());
+
+    if (Scoreboard_log_file_handle)
+    {
+      fprintf(Scoreboard_log_file_handle,"\n\nSCOREBOARD ERROR: t=%d: Scoreboard Error "
+             "while doing updates\n", get_cycle());
+      fprintf(Scoreboard_log_file_handle, " \n\n Current Queue at that Address:\n\n");
+      if (assoc_index(CHECK, Trace_Q_Array, last_trans.destinationAddr)){
+        Trace_Q_Array[last_trans.destinationAddr].logMeToFile(Scoreboard_log_file_handle);
+      }           
+    }
+    scoreboard_fail();
+    return;
+  }
+}
+
+//-------------------------------------------------------------------------
+//---------------------- Check tasks/functions
+//-------------------------------------------------------------------------
+/* CheckLastReceived -
+ * This is a chceck that make sure that the received LOAD transaction
+ * was previously saved.
+ * For this check, any older value stored is consider good.
+ * The function returns 0 if successful, 1 otherwise.
+ */
+function integer Scoreboard::CheckLastReceived(Trace_trans last_trans, Trace_trans_Q added_to_q)
+{
+  integer jdx = 0;
+  integer q_size = 0;
+  bit[31:0] last_addr = last_trans.destinationAddr;
+  Trace_trans trac_to_compare_with;
+  integer value_was_not_stored;
+  /*keep track if this processor has done a store here,
+   * in case this is the first load. If the processor
+   * has not done a store and this is the first load,
+   * then allow it. 
+   */
+  bit this_proc_stored_here = 0;
+  
+  // Initial return value is 1 (as in data not found)
+  CheckLastReceived = 1;
+  value_was_not_stored  = 1;
+  
+  /* This function only checks for regular S_LOAD transactions
+   * For any other case, return 0
+   * MAW- actually now it will check the simple part of the load
+   * transaction (is there some valid data?). Later other functions
+   * will check things like F/E bits or memory barrier operation.
+   */
+  
+  if ((last_trans.operation != S_LOAD)
+      && (last_trans.operation != RAW_LOAD)
+      && (last_trans.operation != SYNCH_LOAD)
+      && (last_trans.operation != FUTURE_LOAD)
+      && (last_trans.operation != RESET_LOAD))
+  {
+    CheckLastReceived = 0;
+    return;
+  }
+
+  // First make sure that this queue was ever used:
+  //if (assoc_index(CHECK, Trace_Q_Array, last_addr) && (Trace_Q_Array[last_addr] !=null))
+  if (added_to_q != null)
+  {
+    // Get the relevant queue size:
+    q_size = added_to_q.size();
+    // Now look at all earlier transactions
+    for (jdx = q_size-2; jdx >=0; jdx--) /* To Me:
+                                          * Trace_Q_Arr[last_addr].at(q_size-1)
+                                          * is the current trans (last_trans)
+                                          * and thus we start with jdx=q_size-2.
+                                          */
+    {         
+      trac_to_compare_with = added_to_q.at(jdx);
+      
+      /* We now compare the current S_LOAD transaction with any S_STORE  
+       * transaction which is valid for the sender cpu of this current S_LOAD
+       * transaction.
+       */
+      if (trac_to_compare_with.operation == S_STORE ||
+          trac_to_compare_with.operation == RAW_STORE ||
+          trac_to_compare_with.operation == SYNCH_STORE ||
+          trac_to_compare_with.operation == SET_STORE){
+        if (last_trans.senderID >= 0 && last_trans.senderID <= num_cpus-1){
+          if((trac_to_compare_with.is_valid_for_cpu[last_trans.senderID] >= last_trans.timeStart))
+          {
+            if (last_trans.data == trac_to_compare_with.data)
+            {
+              value_was_not_stored  = 0;
+              break; // if the value was found, no need to continue the loop
+            }
+          }
+        }
+        else {/*this transaction doesn't come from a processor. go easy on checking it*/
+          if (last_trans.data == trac_to_compare_with.data){
+            value_was_not_stored = 0;
+            break;
+          }
+        }
+        
+      }
+    }/*for loop*/
+      
+  }// end of "if (assoc_index(CHEC..."
+  else
+  {
+    printf("t=%d, SCOREBOARD ERROR: CheckLastReceived called before relevant queue existed."
+           " Address=0x%8x, Data=0x%8x\n", get_cycle(),
+           last_trans.destinationAddr, last_trans.data);
+    CheckLastReceived = 1;
+    return;
+  }
+
+
+  // Finally, make a decision: Was this check successfull?
+  if (value_was_not_stored)
+  {
+    /*HACK: if its transactional, allow loads of 0 (returned at Hard Interrupt),
+      and just mark the transaction as bad.*/
+    if (last_trans.transactional){
+      Tcc_Array[last_trans.senderID/CPUS_PER_TILE].can_commit = 0;
+      printf("SCOREBOARD WARNING: TCC transaction from %d will not be allowed to commit due to bad load:\n",
+             last_trans.senderID);
+      last_trans.PrintMeShort();
+      CheckLastReceived = 0;
+      return;
+    }
+    printf( "\n SCOREBOARD ERROR: ");
+    last_trans.PrintMeShort();
+    printf("The value loaded from address 0x%x (data = 0x%x) is not a valid value. \n"
+           "allowed values: ", last_trans.destinationAddr, last_trans.data);
+    // Get the relevant queue size:
+    q_size = added_to_q.size();
+    // Now look at all earlier transactions
+    for (jdx = q_size-2; jdx >=0; jdx--) /* To Me:
+                                          * Trace_Q_Arr[last_addr].at(q_size-1)
+                                          * is the current trans (last_trans)
+                                          * and thus we start with jdx=q_size-2.
+                                          */
+    {         
+      trac_to_compare_with = added_to_q.at(jdx);
+      
+      /* We now compare the current S_LOAD transaction with any S_STORE  
+       * transaction which is valid for the sender cpu of this current S_LOAD
+       * transaction.
+       */
+      if (trac_to_compare_with.operation == S_STORE ||
+          trac_to_compare_with.operation == RAW_STORE ||
+          trac_to_compare_with.operation == SYNCH_STORE ||
+          trac_to_compare_with.operation == SET_STORE){
+        if (last_trans.senderID >= 0 && last_trans.senderID <= num_cpus-1){
+          if((trac_to_compare_with.is_valid_for_cpu[last_trans.senderID] >= last_trans.timeStart))
+          {
+            printf(" 0x%x,", trac_to_compare_with.data);
+          }
+        }
+        else {/*this transaction doesn't come from a processor. go easy on checking it*/
+          printf(" 0x%x, ", trac_to_compare_with.data);    
+        }
+      }
+    }
+    printf("\n");
+//    printf("Please see Quad_Scoreboard.log for more details.\n", last_trans.destinationAddr, last_trans.data);
+    CheckLastReceived = 1;
+    return;
+  }
+  else
+    CheckLastReceived = 0;
+}
+
+
+//-------------------------------------------------------------------------
+/* CheckLastFullEmpty -
+ * This is a check for syncops that use the F/E bit. It should
+ * be called on the COMPLETIOn of a sync op : the store needs
+ * to have actually completed. (TODO: change Scoreboard_aop_links).
+ * Also, for efficiency & memory, you should just do this
+ * check and update on a word level, since there is no masking for sync ops.
+ */
+function integer Scoreboard::CheckLastFullEmpty(Trace_trans sync_trans, Trace_trans_Q added_to_q)
+{
+  bit[31:0] last_addr = sync_trans.destinationAddr;
+  
+  
+  // Initial return value is 1 (as in data not found)
+  CheckLastFullEmpty = 1;
+
+  /*do this only for the word-aligned address of each 4-byte word*/
+  if (last_addr[1:0] != 0){
+    CheckLastFullEmpty = 0;
+    return;
+  }     
+  //if (assoc_index(CHECK, Trace_Q_Array, last_addr) && (Trace_Q_Array[last_addr] != null)){
+  if (added_to_q != null){      
+    Trace_trans_Q q = added_to_q;
+
+    case(sync_trans.operation){
+      SYNCH_LOAD, FUTURE_LOAD:
+      {
+        if (q.isPossiblyFullBetween(sync_trans.timeStart, sync_trans.timeEnd)){
+          CheckLastFullEmpty = 0;
+        }
+        else{
+          CheckLastFullEmpty = 1;
+        }
+      }
+      SYNCH_STORE:
+      {
+        if (q.isPossiblyEmptyBetween(sync_trans.timeStart, sync_trans.timeEnd)){
+          CheckLastFullEmpty = 0;
+        }
+        else{
+          CheckLastFullEmpty = 1;
+        }
+      }
+      default:{
+        CheckLastFullEmpty = 0;
+      }
+    }
+    if (CheckLastFullEmpty){
+      printf("t=%d, SCOREBOARD ERROR: CheckLastFullEmpty CHECK failed... the required F/E bit is not possible."
+           " Address=0x%8x, Data=0x%8x\n. See Quad_Scoreboard.log for details.\n ", get_cycle(),
+           sync_trans.destinationAddr, sync_trans.data);
+    }
+    return;
+  }
+  else{
+    printf("t=%d, SCOREBOARD ERROR: CheckLastFullEmpty called before relevant queue existed."
+           " Address=0x%8x, Data=0x%8x\n.", get_cycle(),
+           sync_trans.destinationAddr, sync_trans.data);
+    CheckLastFullEmpty = 1;
+    return;
+  }
+}
+
+
+
+
+//-------------------------------------------------------------------------
+//---------------------- Update tasks/functions
+//-------------------------------------------------------------------------
+/* UpdateSimple:
+ * function to update the data structures once a second store to the same
+ * address by the same CPU was spoted
+ */
+function integer Scoreboard::UpdateSimple(Trace_trans store_trans, Trace_trans_Q added_to_q)
+{
+  integer senderID = store_trans.senderID;
+  bit [31:0] addr = store_trans.destinationAddr;
+  integer q_size = 0;
+  integer idx = 0;
+  Trace_trans old_trans;
+
+  // If this is not a store transaction -> return
+  if (store_trans.operation != S_STORE &&
+      store_trans.operation != SYNCH_STORE &&
+      store_trans.operation != RAW_STORE &&
+      store_trans.operation != SET_STORE)
+  {
+    UpdateSimple = 0;
+    return;
+  }
+  
+  if (store_trans.senderID < 0 || store_trans.senderID > num_cpus-1){
+    /*TODO: make this invalidate some CPU stores somehow, but for now
+     * we have no real way of knowing the way things will work out, so
+     * just go easy on the checkign for now
+     */
+    UpdateSimple = 0;
+    return;
+  }
+  
+  //if (assoc_index(CHECK, Trace_Q_Array, addr) && (Trace_Q_Array[addr] != null))
+  if (added_to_q != null)
+  {
+    // Get the relevant queue size:
+    q_size = added_to_q.size();
+
+    // Now look at all earlier transactions
+    for (idx = q_size-2; idx >=0; idx--) /* To Me:
+                                          * Trace_Q_Arr[addr].at(q_size-1)
+                                          * is the current trans (store_trans)
+                                          * and thus we start with idx=q_size-2.
+                                          */
+    {
+      old_trans = added_to_q.at(idx);
+
+      // invalidate old stores of the same origin, or those sent by environment.
+      if (((old_trans.operation == S_STORE) ||
+           (old_trans.operation == SYNCH_STORE) ||
+           (old_trans.operation == RAW_STORE) ||
+           (old_trans.operation == SET_STORE)
+           ) &&
+          ((old_trans.senderID == senderID)  ||   // old stores of same cpu
+           (old_trans.senderID == TESTER_ID) ||
+           (old_trans.senderID == MAINMEM_ID) ||// old stores set by tester
+           (old_trans.senderID == SCOREBOARD_ID)) // old stores set by scoreboard
+          )
+      {
+        /*transactional stores only have the power to overwrite transactional stores, which
+         * is a little inaccurate but TODO later.*/
+        if (!store_trans.transactional || old_trans.transactional){
+      
+          old_trans.is_valid_for_cpu[senderID] = old_trans.is_valid_for_cpu[senderID] < store_trans.timeStart?
+            old_trans.is_valid_for_cpu[senderID]:store_trans.timeStart;
+
+          /* By induction, if every store invalidates its proceeding stores,
+           * than we need only to apply this to the last transaction.
+           * (thus in order to increase performance, we break the loop.)
+           * TODO: this won't really be true if we have TESTER_ID things
+           * coming in in the middle of stuff, since they won't invalidate
+           * earlier stores.
+           */
+          break;
+        }
+      }
+    }
+  }
+  else
+  {
+    printf("t=%d, SCOREBOARD ERROR: UpdateSimple called before relevant queue existed."
+           " Address=0x%8x, Data=0x%8x\n", get_cycle(),
+           store_trans.destinationAddr, store_trans.data);
+    UpdateSimple = 1;
+    return;
+  }
+ 
+  UpdateSimple = 0;
+}
+
+
+
+
+//-------------------------------------------------------------------------
+/* UpdateAfterStoreTimeBased:
+ * If we assume the max time a store can be stalled is MAX_STORE_STALL_TIME
+ * then we can say that if two stores are executed MAX_STORE_STALL_TIME apart,
+ * then the second will definatley overwrite the first. So we can invalidate the first
+ * some time in the future, perhaps also MAX_STORE_STALL_TIME. This can be done for
+ * ALL processors!
+ */
+function integer Scoreboard::UpdateAfterStoreTimeBased(Trace_trans store_trans,
+                                                       Trace_trans_Q added_to_q)
+{
+  integer senderID = store_trans.senderID;
+  bit [31:0] addr = store_trans.destinationAddr;
+  integer q_size = 0;
+  integer idx = 0;
+  integer jdx = 0;
+  Trace_trans old_trans;
+
+  // If this is not a REGULAR store transaction -> return
+  if (store_trans.operation != S_STORE &&
+      //store_trans.operation != SYNCH_STORE && 
+      store_trans.operation != RAW_STORE &&
+      store_trans.operation != SET_STORE)
+  {
+    UpdateAfterStoreTimeBased = 0;
+    return;
+  }
+
+  /*TODO: make this better!*/
+  if (store_trans.transactional){
+    UpdateAfterStoreTimeBased = 0;
+    return;
+  }
+  
+  if (store_trans.senderID < 0 || store_trans.senderID > num_cpus-1){
+    /*TODO: make this invalidate some CPU stores somehow, but for now
+     * we have no real way of knowing the way things will work out, so
+     * just go easy on the checkign for now
+     */
+    UpdateAfterStoreTimeBased = 0;
+    return;
+  }
+  
+  //if (assoc_index(CHECK, Trace_Q_Array, addr) && (Trace_Q_Array[addr]!=null))
+  if (added_to_q != null)
+  {
+    // Get the relevant queue size:
+    q_size = added_to_q.size();
+
+    // Now look at all earlier transactions
+    for (jdx = q_size-2; jdx >=0; jdx--) /* To Me:
+                                          * Trace_Q_Arr[addr].at(q_size-1)
+                                          * is the current trans (store_trans)
+                                          * and thus we start with idx=q_size-2.
+                                          */
+    {
+      
+      old_trans = added_to_q.at(jdx);
+
+      // invalidate old stores of the same origin, or those sent by environment,
+      //or those where there just is no race (too far apart).
+      if (((old_trans.operation == S_STORE) ||
+           //         (old_trans.operation == SYNCH_STORE) ||
+           /*TODO: fix this ... a synch store could have been stalled for a long time,
+             but by the time we see it, it has definately completed anyway.*/
+           (old_trans.operation == RAW_STORE) ||
+           (old_trans.operation == SET_STORE))){
+             if ((old_trans.timeStart + MaxStoreTime <= store_trans.timeStart) /*there is no race*/
+                 || (old_trans.timeStart < store_trans.timeStart && (old_trans.senderID == store_trans.senderID ||
+                                                                     old_trans.senderID == TESTER_ID ||
+                                                                     old_trans.senderID == MAINMEM_ID ||
+                                                                     old_trans.senderID == SCOREBOARD_ID))){
+               for (idx = 0; idx < num_cpus; idx++){
+                 old_trans.is_valid_for_cpu[idx] = (old_trans.is_valid_for_cpu[idx]<(store_trans.timeStart + MaxStoreTime)?
+                                                    old_trans.is_valid_for_cpu[idx]:store_trans.timeStart + MaxStoreTime);
+               }       
+             } 
+           }
+    }/*for loop*/
+  }
+  else
+  {
+    printf("t=%d, SCOREBOARD ERROR: UpdateAfterStoreTimeBased called before relevant queue existed."
+           " Address=0x%8x, Data=0x%8x\n", get_cycle(),
+           store_trans.destinationAddr, store_trans.data);
+    UpdateAfterStoreTimeBased = 1;
+    return;
+  }
+ 
+  UpdateAfterStoreTimeBased = 0;
+}
+
+
+
+//TODO: make this work...
+//function that invalidates synch stores. Because a synch store is
+// guaranteed to have already completed, then a second
+//synch store to the same address will invalidate all earlier
+//synch stores. Unfortunately, this doesn't QUITE work... some
+// synch stores may complete close together. So this should simply
+// set the completion time of a synch store. UpdateAfterRead should
+// invalidate things that have already completed. For now we will
+// leave this with the MaxStoreTime condition in place.
+function integer Scoreboard::UpdateAfterSynchStore(Trace_trans store_trans){
+
+
+  integer senderID = store_trans.senderID;
+  bit [31:0] addr = store_trans.destinationAddr;
+  integer q_size = 0;
+  integer idx = 0;
+  integer jdx = 0;
+  Trace_trans old_trans;
+
+  // If this is not a SYNCH store transaction -> return
+  if (store_trans.operation != SYNCH_STORE && 
+      store_trans.operation != SET_STORE)
+  {
+    UpdateAfterSynchStore = 0;
+    return;
+  }
+
+  if (store_trans.senderID < 0 || store_trans.senderID > num_cpus-1){
+    /*TODO: make this invalidate some CPU stores somehow, but for now
+     * we have no real way of knowing the way things will work out, so
+     * just go easy on the checkign for now
+     */
+    UpdateAfterSynchStore = 0;
+    return;
+  }
+  
+  if (ignoreAddress != null){
+    if (ignoreAddress.fallsInRange(store_trans.destinationAddr)){
+      Trace_trans_Freelist.push_front(store_trans);
+      if (_DEBUG_){
+        printf("Ignoring transaction:\n");
+        store_trans.LogMeToFileShort(stdout);
+      }      
+      //relese semaphore before leaving!!
+      semaphore_put(semID,1);  
+      return;
+    }
+  }
+  if (assoc_index(CHECK, Trace_Q_Array, addr) && (Trace_Q_Array[addr]!=null))
+  {
+    // Get the relevant queue size:
+    q_size = Trace_Q_Array[addr].size();
+
+    // Now look at all earlier transactions
+    for (jdx = q_size-1; jdx >=0; jdx--) /* To Me:
+                                          * Trace_Q_Arr[addr].at(q_size-1)
+                                          * In this UPDATE, the transaction may
+                                          * not be the latest one. 
+                                          */
+    {
+      
+      old_trans = Trace_Q_Array[addr].at(jdx);
+
+      // invalidate old stores of the same origin, or those sent by environment,
+      //or those where there just is no race (too far apart).
+      if (store_trans == old_trans){
+        continue;
+      }
+      if (((old_trans.operation == SET_STORE) ||
+           (old_trans.operation == SYNCH_STORE))
+          && (old_trans.timeEnd + MaxStoreTime< store_trans.timeEnd)){ 
+        for (idx = 0; idx < num_cpus; idx++){
+          old_trans.is_valid_for_cpu[idx] = (old_trans.is_valid_for_cpu[idx]<(store_trans.timeEnd)?
+                                             old_trans.is_valid_for_cpu[idx]:store_trans.timeEnd);
+        }                       
+      }
+    }
+  }
+  else
+          
+  {
+    printf("t=%d, WARNING: UpdateAfterSynchStore called when relavant queue did not exist."
+           " Address=0x%8x, Data=0x%8x\n", get_cycle(),
+           store_trans.destinationAddr, store_trans.data);
+    UpdateAfterSynchStore = 0;
+    return;
+  }
+ 
+  UpdateAfterSynchStore = 0;  
+}
+
+
+/* -----------------------------------------------------------------------------------
+ * UpdateAfterRead:
+ * When a read is completed which is satisfied by a store by a processor N,
+ * then ALL stores by processor
+ * N up to that time are invalid for ALL processors.
+ */
+function integer Scoreboard::UpdateAfterRead(Trace_trans read_trans, Trace_trans_Q added_to_q)
+{       
+  Trace_trans trac_to_compare_with;       
+
+
+  bit [31:0] last_addr = read_trans.destinationAddr;
+  integer q_size = 0;
+  integer jdx = 0;      
+  integer idx;
+  integer jdx_save;
+  bit found_match = 0;
+  bit found_more_than_one_match = 1;
+  integer matching_sender = 0;
+// If this is not a load transaction -> return
+  if ((read_trans.operation != S_LOAD)
+      && (read_trans.operation != SYNCH_LOAD)
+      && (read_trans.operation != RAW_LOAD)
+      && (read_trans.operation != RESET_LOAD)
+      && (read_trans.operation != FUTURE_LOAD))
+  {     
+    UpdateAfterRead = 0;
+    return;
+  }
+  
+  //Transactional reads should not use this rule, since
+  // they should not affect other processors.
+  if (read_trans.transactional){
+    UpdateAfterRead = 0;
+    return;
+  }
+    
+  //if this didn't come from a processor, return
+  if (read_trans.senderID < 0  || read_trans.senderID > num_cpus-1){
+    UpdateAfterRead = 0;
+    return;
+  }
+  //if (assoc_index(CHECK, Trace_Q_Array, last_addr) && (Trace_Q_Array[last_addr]!=null))
+  if (added_to_q != null){
+  
+  q_size = added_to_q.size();
+    for (jdx = q_size-2; jdx >=0; jdx--) /* To Me:
+                                          * Trace_Q_Arr[last_addr].at(q_size-1)
+                                          * is the current trans (last_trans)
+                                          * and thus we start with jdx=q_size-2.
+                                          */
+      {                 
+      trac_to_compare_with = added_to_q.at(jdx);
+      
+      /* We now compare the current S_LOAD transaction with any S_STORE  
+       * transaction which is valid for the sender cpu of this current S_LOAD
+       * transaction.
+       */
+      if (((trac_to_compare_with.operation == S_STORE)
+           || (trac_to_compare_with.operation == SYNCH_STORE)
+           || (trac_to_compare_with.operation == RAW_STORE)
+           || (trac_to_compare_with.operation == SET_STORE))
+          &&
+          (trac_to_compare_with.is_valid_for_cpu[read_trans.senderID] >= read_trans.timeStart))
+        {       
+          if (read_trans.data == trac_to_compare_with.data)
+          {
+            if (found_match == 1){
+              found_more_than_one_match = 1;
+              break;
+            }
+            found_match   = 1;
+            jdx_save = jdx;
+            matching_sender = trac_to_compare_with.senderID;
+           
+            /*            break; */
+          
+          }
+        }/* else, if this entry in the queue is not a store or not a valid
+          *compare value for the current transaction, simply skip it.
+          */
+    }
+
+    if (found_match == 0)
+    {
+      printf("t=%d, SCOREBOARD ERROR: UpdateAfterRead called when there was no matching store.\n"
+             " Address=0x%8x, Data=0x%8x\n", get_cycle(),
+           read_trans.destinationAddr, read_trans.data);
+      UpdateAfterRead = 1;
+      return;     
+    }         
+
+    if (found_more_than_one_match == 1){
+      /* can't really say anything in this case. */
+      UpdateAfterRead = 0;
+      return;
+    }
+    
+  
+    jdx = jdx_save;
+    trac_to_compare_with = added_to_q.at(jdx);
+     /*since we have read this value, we know that it has definately
+      * committed. So we should update its commit time.
+      */
+    trac_to_compare_with.timeEnd = read_trans.timeEnd < trac_to_compare_with.timeEnd?
+      read_trans.timeEnd:trac_to_compare_with.timeEnd;
+    /*now start searching from where you stopped and invalidate
+     *the earlier stores for all processors*/
+    for (jdx --; jdx >= 0; jdx--){
+      trac_to_compare_with = added_to_q.at(jdx);
+      if (((trac_to_compare_with.operation == S_STORE)
+           || (trac_to_compare_with.operation == SYNCH_STORE)
+           || (trac_to_compare_with.operation == RAW_STORE)
+           || (trac_to_compare_with.operation == SET_STORE))
+          &&
+          (trac_to_compare_with.senderID == matching_sender ||
+           trac_to_compare_with.senderID == SCOREBOARD_ID ||
+           trac_to_compare_with.senderID == TESTER_ID ||
+           trac_to_compare_with.senderID == MAINMEM_ID)){
+        for (idx = 0; idx < num_cpus; idx++){
+        trac_to_compare_with.is_valid_for_cpu[idx] = trac_to_compare_with.is_valid_for_cpu[idx]<read_trans.timeEnd?
+          trac_to_compare_with.is_valid_for_cpu[idx]: read_trans.timeEnd;
+        }
+      }
+      /*can't break teh loop here, we don't have the induction property. this could be made better
+       * in the future, but we're going to use it to do GC anyway.
+       */
+    }   
+  }
+  else
+  {
+    printf("t=%d, SCOREBOARD ERROR: UpdateAfterRead called before relevant queue existed."
+           " Address=0x%8x, Data=0x%8x\n", get_cycle(),
+           read_trans.destinationAddr, read_trans.data);
+    UpdateAfterRead = 1;
+    return;
+  }
+ 
+  UpdateAfterRead = 0;
+}
+
+
+
+/* -----------------------------------------------------------------------------------
+ * UpdateAfterReadForOtherProcs:
+ * If we do a read at time "x" and it is satisfied by some transaction,
+ * then ANY stores by other processors which were COMPLETED before "x"
+ * are now invalid from this time on.
+ */
+function integer Scoreboard::UpdateAfterReadForOtherProcs(Trace_trans read_trans,
+                                                          Trace_trans_Q added_to_q)
+{       
+  Trace_trans trac_to_compare_with;       
+
+
+  bit [31:0] last_addr = read_trans.destinationAddr;
+  integer q_size = 0;
+  integer jdx = 0;      
+  integer idx;
+  bit found_match = 0;
+  bit found_more_than_one_match = 0;
+  integer matching_sender = 0;
+  integer matching_completion_time = INFINITY;
+// If this is not a load transaction -> return
+  if ((read_trans.operation != S_LOAD)
+      && (read_trans.operation != SYNCH_LOAD)
+      && (read_trans.operation != RAW_LOAD)
+      && (read_trans.operation != RESET_LOAD)
+      && (read_trans.operation != FUTURE_LOAD))
+  {     
+    UpdateAfterReadForOtherProcs = 0;
+    return;
+  }             
+
+  //if this didn't come from a processor, return
+  if (read_trans.senderID < 0  || read_trans.senderID > num_cpus-1){
+    UpdateAfterReadForOtherProcs = 0;
+    return;
+  }
+
+  //if this is a transactional load, it should not affect other processors.
+  if (read_trans.transactional){
+    UpdateAfterReadForOtherProcs = 0;
+    return;
+  }
+  //if (assoc_index(CHECK, Trace_Q_Array, last_addr) && (Trace_Q_Array[last_addr]!=null))
+  if (added_to_q != null){
+  
+  q_size = added_to_q.size();
+    for (jdx = q_size-2; jdx >=0; jdx--) /* To Me:
+                                          * Trace_Q_Arr[last_addr].at(q_size-1)
+                                          * is the current trans (last_trans)
+                                          * and thus we start with jdx=q_size-2.
+                                          */
+      {                 
+      trac_to_compare_with = added_to_q.at(jdx);
+      
+      /* We now compare the current S_LOAD transaction with any S_STORE  
+       * transaction which is valid for the sender cpu of this current S_LOAD
+       * transaction.
+       */
+      if (((trac_to_compare_with.operation == S_STORE)
+           || (trac_to_compare_with.operation == SYNCH_STORE)
+           || (trac_to_compare_with.operation == RAW_STORE)
+           || (trac_to_compare_with.operation == SET_STORE))
+          &&
+          (trac_to_compare_with.is_valid_for_cpu[read_trans.senderID] >= read_trans.timeStart))
+        {       
+          if (read_trans.data == trac_to_compare_with.data)
+          {
+            if (found_match == 1){
+              found_more_than_one_match = 1;
+              break;
+            }
+            
+            found_match   = 1;
+            matching_sender = jdx;
+            matching_completion_time = trac_to_compare_with.timeEnd;
+            /*break;*/
+          
+          }
+        }/* else, if this entry in the queue is not a store or not a valid
+          *compare value for the current transaction, simply skip it.
+          */
+    }
+
+    if (found_more_than_one_match == 1){
+      /*can't really say anything about this*/
+      UpdateAfterReadForOtherProcs = 0;
+      return;
+    }
+    
+    if (found_match == 0)
+    {
+      printf("t=%d, SCOREBOARD ERROR: UpdateAfterReadForOtherProcs called when there was no matching store.\n"
+             " Address=0x%8x, Data=0x%8x\n", get_cycle(),
+           read_trans.destinationAddr, read_trans.data);
+      UpdateAfterReadForOtherProcs = 1;
+      return;     
+    }         
+
+    
+    /*now start searching and invalidate ANY completed stores
+     * to this address except for the one we have.*/
+    for (jdx = added_to_q.size()-2; jdx >= 0; jdx--){
+      if (jdx == matching_sender){
+        continue;
+      }
+      trac_to_compare_with = added_to_q.at(jdx);
+      if (((trac_to_compare_with.operation == S_STORE)
+           || (trac_to_compare_with.operation == SYNCH_STORE)
+           || (trac_to_compare_with.operation == RAW_STORE)
+           || (trac_to_compare_with.operation == SET_STORE))
+          &&
+          (trac_to_compare_with.timeEnd < read_trans.timeStart)
+          &&(!trac_to_compare_with.transactional)){ 
+        for (idx = 0; idx < num_cpus; idx++){         
+          /*trac_to_compare_with.is_valid_for_cpu[idx] =
+            trac_to_compare_with.is_valid_for_cpu[idx]<read_trans.timeEnd?
+            trac_to_compare_with.is_valid_for_cpu[idx]: read_trans.timeEnd;
+            */
+          trac_to_compare_with.is_valid_for_cpu[idx] =
+            trac_to_compare_with.is_valid_for_cpu[idx] <
+            matching_completion_time?
+            trac_to_compare_with.is_valid_for_cpu[idx]:
+            matching_completion_time;
+        }             
+        
+      }     
+      /* can't break teh loop here, we don't have the
+       * induction property. this could be made better
+       * in the future, but we're going to use it to do GC anyway.
+       */
+    }   
+  }
+  else
+  {
+    printf("t=%d, SCOREBOARD ERROR: UpdateAfterReadForOtherProcs called before relevant queue existed."
+           " Address=0x%8x, Data=0x%8x\n", get_cycle(),
+           read_trans.destinationAddr, read_trans.data);
+    UpdateAfterReadForOtherProcs = 1;
+    return;
+  }
+ 
+  UpdateAfterReadForOtherProcs = 0;
+}
+
+//Add outstanding stores to a supplementary data structure for each processor.
+// These can be removed from this structure in various ways. This structure
+// facilitates operations that need to update outstanding stores for a processor,
+// such as mem-bars or UpdateAfterReadTSO (currently used only for TSO)
+
+function integer Scoreboard::UpdateAddToStoreQueue(Trace_trans last_trans){
+
+  /*Do this only for stores by processors*/
+  if ((last_trans.operation != S_STORE)
+       && (last_trans.operation != RAW_STORE))
+  {
+    
+    UpdateAddToStoreQueue = 0;
+    return;
+  }
+
+  if (last_trans.senderID < 0 || last_trans.senderID >= num_cpus){
+    UpdateAddToStoreQueue = 0;
+    return;
+  }
+
+  
+  Store_Queues[last_trans.senderID].ttQ.push_back(last_trans);
+  UpdateAddToStoreQueue = 0;
+  
+}
+
+
+  
+//function used for TSO: once a value has definately already completed,
+//invalidate all earlier stores by the processor TO ALL ADDRESSES. Actually,
+// no need to INVALIDATE the stores, but simply to mark their completion
+// times.
+function integer Scoreboard::UpdateAfterReadTSO(Trace_trans read_trans,
+                                                   Trace_trans_Q added_to_q){
+
+  Trace_trans trac_to_compare_with;       
+
+  bit [31:0] last_addr = read_trans.destinationAddr;
+  integer q_size = 0;
+  integer jdx = 0;      
+  integer idx;
+  integer jdx_save;
+  bit found_match = 0;
+  bit found_more_than_one_match = 1;
+  integer matching_sender = 0;
+  Store_Queue sq;
+  // If this is not a load transaction -> return
+  if ((read_trans.operation != S_LOAD)
+      && (read_trans.operation != SYNCH_LOAD)
+      && (read_trans.operation != RAW_LOAD)
+      && (read_trans.operation != RESET_LOAD)
+      && (read_trans.operation != FUTURE_LOAD))
+  {     
+    UpdateAfterReadTSO = 0;
+    return;
+  }
+  
+  //Transactional reads should not use this rule, since
+  // they should not affect other processors.
+  if (read_trans.transactional){
+    UpdateAfterReadTSO = 0;
+    return;
+  }
+    
+  //if this didn't come from a processor, return
+  if (read_trans.senderID < 0  || read_trans.senderID > num_cpus-1){
+    UpdateAfterReadTSO = 0;
+    return;
+  }
+  //if (assoc_index(CHECK, Trace_Q_Array, last_addr) && (Trace_Q_Array[last_addr]!=null))
+  if (added_to_q != null){
+  
+    q_size = added_to_q.size();
+    for (jdx = q_size-2; jdx >=0; jdx--) /* To Me:
+                                          * Trace_Q_Arr[last_addr].at(q_size-1)
+                                          * is the current trans (last_trans)
+                                          * and thus we start with jdx=q_size-2.
+                                          */
+    {                 
+      trac_to_compare_with = added_to_q.at(jdx);
+      
+      /* We now compare the current S_LOAD transaction with any S_STORE  
+       * transaction which is valid for the sender cpu of this current S_LOAD
+       * transaction.
+       */
+      if (((trac_to_compare_with.operation == S_STORE)
+           || (trac_to_compare_with.operation == SYNCH_STORE)
+           || (trac_to_compare_with.operation == RAW_STORE)
+           || (trac_to_compare_with.operation == SET_STORE))
+          &&
+          (trac_to_compare_with.is_valid_for_cpu[read_trans.senderID] >= read_trans.timeStart))
+        {       
+          if (read_trans.data == trac_to_compare_with.data)
+          {
+            if (found_match == 1){
+              found_more_than_one_match = 1;
+              break;
+            }
+            found_match   = 1;
+            jdx_save = jdx;
+            matching_sender = trac_to_compare_with.senderID;
+           
+            /*            break; */
+          
+          }
+      }/* else, if this entry in the queue is not a store or not a valid
+        *compare value for the current transaction, simply skip it.
+        */
+    }
+
+    if (found_match == 0)
+    {
+      printf("t=%d, SCOREBOARD ERROR: UpdateAfterReadTSO called when there was no matching store.\n"
+             " Address=0x%8x, Data=0x%8x\n", get_cycle(),
+           read_trans.destinationAddr, read_trans.data);
+      UpdateAfterReadTSO = 1;
+      return;     
+    }         
+
+    if (found_more_than_one_match == 1){
+      /* can't really say anything in this case. */
+      UpdateAfterReadTSO = 0;
+      return;
+    }
+    
+  
+    jdx = jdx_save;
+    trac_to_compare_with = added_to_q.at(jdx);
+    
+    /*TSO part: for EVERY "outstanding" store by this processor in the
+     * whole scoreboard, mark it as completed. Could be more efficient with
+     * another supporting data structure. (TODO)
+     */
+    sq = Store_Queues[matching_sender];
+    for (jdx = 0; jdx < sq.ttQ.size(); jdx ++){
+      
+      Trace_trans trac_to_update;
+      trac_to_update = sq.ttQ[jdx];
+      trac_to_update.timeEnd =  trac_to_update.timeStart < trac_to_compare_with.timeStart?
+        trac_to_compare_with.timeEnd:trac_to_update.timeEnd;
+      /*We can remove the stores now, or later... probably easiest to just
+       * remove them later.
+       */
+    }
+  }      
+  else
+  {
+    printf("t=%d, SCOREBOARD ERROR: UpdateAfterReadTSO called before relevant queue existed."
+           " Address=0x%8x, Data=0x%8x\n", get_cycle(),
+           read_trans.destinationAddr, read_trans.data);
+    UpdateAfterReadTSO = 1;
+    return;
+  }
+
+  
+  UpdateAfterReadTSO = 0;
+}
+
+/* -----------------------------------------------------------------------------------
+ * UpdateAfterReadTCC:
+ * This is for transactional loads. If they are loading from an address which has
+ * another processor committing to it, and they load the value which is not committing,
+ * then the COULD violate (this is as tight as I could get it!)
+ */
+function integer Scoreboard::UpdateAfterReadTCC(Trace_trans read_trans, Trace_trans_Q added_to_q)
+{       
+  Trace_trans trac_to_compare_with;       
+
+  bit [31:0] last_addr = read_trans.destinationAddr;
+  integer q_size = 0;
+  integer jdx = 0;      
+  integer idx;
+  bit found_match = 0;
+  integer matching_sender = 0;
+  //if this is not a transactional op -> return
+  if (!read_trans.transactional){
+    UpdateAfterReadTCC = 0;
+    return;
+  }
+ 
+  // If this is not a load transaction -> return
+  
+  if ((read_trans.operation != S_LOAD)
+      && (read_trans.operation != SYNCH_LOAD)
+      && (read_trans.operation != RAW_LOAD)
+      && (read_trans.operation != RESET_LOAD)
+      && (read_trans.operation != FUTURE_LOAD))
+  {     
+    UpdateAfterReadTCC = 0;
+    return;
+  }
+      
+  //if (assoc_index(CHECK, Trace_Q_Array, last_addr) && (Trace_Q_Array[last_addr]!=null))
+  if (added_to_q != null){
+  
+    q_size = added_to_q.size();
+    for (jdx = q_size-2; jdx >=0; jdx--) /* To Me:
+                                          * Trace_Q_Arr[last_addr].at(q_size-1)
+                                          * is the current trans (last_trans)
+                                          * and thus we start with jdx=q_size-2.
+                                          */
+    {                 
+      trac_to_compare_with = added_to_q.at(jdx);
+      
+      /* We now compare the current S_LOAD transaction with any S_STORE  
+       * transaction which is valid for the sender cpu of this current S_LOAD
+       * transaction.
+       */
+      if (trac_to_compare_with.transactional
+          &&((trac_to_compare_with.operation == S_STORE)
+             || (trac_to_compare_with.operation == SYNCH_STORE)
+             || (trac_to_compare_with.operation == RAW_STORE)
+             || (trac_to_compare_with.operation == SET_STORE))
+          &&
+          (trac_to_compare_with.is_valid_for_cpu[read_trans.senderID] >= 0))
+          /*then this is a committing store*/
+        {       
+        if (/*read_trans.data != trac_to_compare_with.data && */
+            read_trans.senderID != trac_to_compare_with.senderID)
+        {
+          TCC_Transaction tcc = Tcc_Array[read_trans.senderID/CPUS_PER_TILE];
+          if (!tcc.can_violate && _DEBUG_){
+            printf("SCOREBOARD INFO: TCC transaction for proc %d could violate due to committing store by %d\n",
+                   read_trans.senderID, trac_to_compare_with.senderID);
+          }
+          tcc.can_violate = 1;
+        }
+      }
+    }//for all transactions in the queue
+  } //if added_to_queue is not null
+  else{
+    printf("t=%d, SCOREBOARD ERROR: UpdateAfterReadTCC called before relevant queue existed."
+           " Address=0x%8x", get_cycle(),
+           read_trans.destinationAddr);
+    UpdateAfterReadTCC = 1;
+    return;
+  }
+  
+  UpdateAfterReadTCC = 0;
+}
+
+
+
+
+
+//----------------------------------------------------------------------
+// UpdateFullEmpty:
+// This function attempts to geta  rough approximation for what is possible
+// and impossible for the F/E bits in the processor.
+//
+
+function integer Scoreboard::UpdateFullEmpty(Trace_trans last_trans, Trace_trans_Q added_to_q){
+
+  bit[31:0] last_addr = last_trans.destinationAddr;
+  /*only consider F/E bits on a word level*/
+  if (last_addr[1:0] !=0){
+    UpdateFullEmpty = 0;
+    return;
+  }
+  if (added_to_q != null){
+
+    case(last_trans.operation){
+      SYNCH_STORE, SET_STORE:{
+        /*it is impossible that this is empty after this completes.*/
+        added_to_q.setImpossibleEmptyAfter(last_trans.timeEnd);
+        /*This could have become full any tiem during this transaction*/
+        added_to_q.setPossibleFullBetween(last_trans.timeStart, INFINITY);
+        UpdateFullEmpty = 0;
+      }
+      SYNCH_LOAD, RESET_LOAD:{      
+        /* same as for store, but reversed*/
+        /*it is impossible that this is full after this completes.*/
+        added_to_q.setImpossibleFullAfter(last_trans.timeEnd);
+        /*This could have become full any tiem during this transaction*/
+        added_to_q.setPossibleEmptyBetween(last_trans.timeStart, INFINITY);
+        UpdateFullEmpty = 0;
+      }
+      default:{
+        UpdateFullEmpty = 0;
+      } 
+    }
+   return; 
+  }
+  else{
+     printf("t=%d, SCOREBOARD ERROR: UpdateFullEmpty called before relevant queue existed."
+           " Address=0x%8x, Data=0x%8x\n", get_cycle(),
+           last_trans.destinationAddr, last_trans.data);
+    UpdateFullEmpty = 1;
+    return;
+  }
+}
+
+
+//------------------------------------------------------------------------
+/* UpdateRecordTransTime:
+ * The Garbage Collector will periodically check for "invalid" transactions
+ * that can be deleted. A transaction is invalid if it is invalid
+ * for all processors after time N and all processors have completed operations
+ * up to time N. This records the latest time that each processor has
+ * completed a transaction.
+ */
+
+function integer Scoreboard::UpdateRecordTransTime(Trace_trans last_trans){
+
+  if (last_trans.senderID >= num_cpus){
+    /*not a processor operation*/
+    UpdateRecordTransTime = 0;
+    return;
+  }
+  
+  last_transaction_time[last_trans.senderID]  = last_trans.timeStart;
+  UpdateRecordTransTime = 0;
+  return;
+}
+  
+//-------------------------------------------------------------------------
+/* UpdateRemoveReads:
+ * In our current implementation there is no reason to store reads,
+ * because we save the information given to us by the read in the store
+ * transactions. So if the last operation was a read, just remove it to
+ * the queue.
+ * 
+ * 
+ */
+function integer Scoreboard::UpdateRemoveRead(Trace_trans last_trans, Trace_trans_Q added_to_q){
+  bit[31:0] last_addr = last_trans.destinationAddr;
+  /*leave transactional loads*/
+  if (!last_trans.transactional){
+    if (last_trans.operation == S_LOAD ||
+        last_trans.operation == FUTURE_LOAD ||
+        last_trans.operation == RAW_LOAD ||
+        last_trans.operation == RESET_LOAD ||
+        last_trans.operation == SYNCH_LOAD){
+      Trace_trans last_one = added_to_q.pop_back();
+      last_one.transactional = 0;
+      Trace_trans_Freelist.push_front(last_one);
+      if (last_one != last_trans){
+        printf("t=%d, SCOREBOARD ERROR: UpdateRemoveRead attempt to remove a "
+               "read that was not the last transaction."
+               " Address=0x%8x, Data=0x%8x\n", get_cycle(),
+               last_trans.destinationAddr, last_trans.data);
+        UpdateRemoveRead = 1;     
+        return;
+      }
+       
+    }
+  }
+  UpdateRemoveRead = 0;
+  return;
+}
+
+//-------------------------------------------------------------------------
+/* UpdateTCC:
+ * In general, the operations for a TCC transaction
+ * are very similar. However, we don't want the
+ * new transaction in the queue to show up as valid
+ * for all CPUs until INFINITY, but actually to 0.
+ * In addition, we need to update the pointers in the
+ * Tcc_Array to track this transaction.
+ */
+function integer Scoreboard::UpdateTCC(Trace_trans last_trans, Trace_trans_Q added_to_q){
+  TCC_Transaction tcc;
+  bit[31:0] last_addr = last_trans.destinationAddr;
+  integer proc;
+  /*First, we only care about this if the sender is in a transaction*/
+  if (!(last_trans.senderID < num_cpus && Tcc_Array[last_trans.senderID/CPUS_PER_TILE].valid)){
+    UpdateTCC = 0;
+    return;
+  }
+  tcc = Tcc_Array[last_trans.senderID/CPUS_PER_TILE];
+
+  /*Only set as transactional those things that are stored in the TCC coherent/buffered regions.*/
+  if (!tccAddress.fallsInRange(last_trans.destinationAddr)){
+    UpdateTCC = 0;
+    return;
+  }
+  if (tcc.committing){
+    /*TODO: is this an error?*/
+    /*printf("t=%d, Scoreboard SCOREBOARD ERROR, access to TCC coherent range when committing by %d\n",
+      get_cycle(), last_trans.senderID);
+      UpdateTCC = 1;
+      return;
+    */
+  }
+
+  /*set this transaction to be invalid for all CPU's except the sender. We
+   * don't really care what kind of operation it is. (Note that for loads
+   * this acts as a "dirty" bit.
+   */
+  for (proc = 0; proc < num_cpus; proc++){
+    if( (last_trans.operation == S_LOAD || last_trans.operation == RAW_LOAD) ||
+       proc!= last_trans.senderID){
+      last_trans.is_valid_for_cpu[proc] = 0;
+    }
+  }
+
+  /*add this transaction to the processor's transaction queue, FIFO style (this
+   way we can do them in order, normally, later)*/
+  last_trans.transactional = 1;
+  last_trans.locked = 1; /*don't allow gcing*/
+  tcc.ttQ.push_back(last_trans);
+  UpdateTCC = 0;
+}
+
+
+
+/*---------------------------------------------------------------------------------------------------
+ *UpdateAfterTCCCommit
+ *When a transactional store definately commits, then:
+ * its end time should be set. It will invalidate any stores which have
+ * end times which are earlier. than this transactions end time for all processors.
+ * (Regular stores need to have their end times set correctly... does this happen now?
+ * TODO: make sure regular stores get their end times set. This can be done either
+ * with MaxStoreTime, or with UpdateAfterRead.
+ */
+function integer Scoreboard::UpdateAfterTCCCommit(Trace_trans store_trans){
+
+
+  integer senderID = store_trans.senderID;
+  bit [31:0] addr = store_trans.destinationAddr;
+  integer q_size = 0;
+  integer idx = 0;
+  integer jdx = 0;
+  integer kdx = 0;
+  Trace_trans old_trans;
+
+  // If this is not a store transaction -> return
+  if (store_trans.operation != S_STORE && 
+      store_trans.operation != RAW_STORE
+      /*it doesn't really make sense to test for SET_STORE or SYNC_STORE...
+       * what can these mean inside TCC transactions??*/
+      )
+  {
+    UpdateAfterTCCCommit = 0;
+    return;
+  }
+
+  if (store_trans.senderID < 0 || store_trans.senderID > num_cpus-1){
+    /*TODO: make this invalidate some CPU stores somehow, but for now
+     * we have no real way of knowing the way things will work out, so
+     * just go easy on the checkign for now
+     */
+    UpdateAfterTCCCommit = 0;
+    return;
+  }
+  if (_DEBUG_ >15 && addr == INTERESTING){
+    fprintf(Scoreboard_log_file_handle, "BEFORE UPDATE AFTER TCC COMMIT:\n");
+    Trace_Q_Array[addr].logMeToFile(Scoreboard_log_file_handle);
+    fprintf(Scoreboard_log_file_handle, "\n************************\n");
+  }
+  if (assoc_index(CHECK, Trace_Q_Array, addr) && (Trace_Q_Array[addr]!=null))
+  {
+    // Get the relevant queue size:
+    q_size = Trace_Q_Array[addr].size();
+
+    // Now look at all earlier transactions
+    for (jdx = q_size-1; jdx >=0; jdx--) /* To Me:
+                                          * Trace_Q_Arr[addr].at(q_size-1)
+                                          * In this UPDATE, the transaction may
+                                          * not be the latest one. 
+                                          */
+    {
+      
+      old_trans = Trace_Q_Array[addr].at(jdx);
+
+      if (store_trans == old_trans){
+        continue;
+      }
+      if (((old_trans.operation == S_STORE) ||
+           (old_trans.operation == RAW_STORE))
+           && (!old_trans.transactional)
+          && (old_trans.timeEnd < store_trans.timeEnd)){ 
+        for (idx = 0; idx < num_cpus; idx++){
+          old_trans.is_valid_for_cpu[idx] = (old_trans.is_valid_for_cpu[idx]<(store_trans.timeEnd)?
+                                             old_trans.is_valid_for_cpu[idx]:store_trans.timeEnd);
+        }                       
+      }
+      else{
+        if (old_trans.transactional){
+          /*this is a transactional load to the same address... or it should be.*/
+          if (old_trans.operation == S_LOAD || old_trans.operation == RAW_LOAD){
+            /*invalidate the corresponding TCC transaction - it has been violated!*/
+            /*IF the dirty bit is set! If it is not, then this load happened AFTER TccCommitStart,
+             * so it should be allowed.
+             */
+            TCC_Transaction tcc; 
+            if (old_trans.senderID == store_trans.senderID){
+              continue;
+            }
+
+            if (!old_trans.is_valid_for_cpu[store_trans.senderID/CPUS_PER_TILE]){
+              /*not dirty, no need to violate automatically.
+               *Check the value received.*/
+              if (old_trans.data == store_trans.data){
+                /*This one has already read the committed data. It's OK.*/
+                if (_DEBUG_){
+                  printf("SCOREBOARD INFO: Proc %d's transaction at 0x%x could have violated by proc %d, but wasn't dirty.\n"
+                         "SCOREBOARD INFO: Proc %d read the committed value of %x\n",
+                         old_trans.senderID, old_trans.destinationAddr, store_trans.senderID, old_trans.senderID, old_trans.data);
+                }
+                continue;
+              }else{
+                /*need to consider whether this word was not really SR, because it had already
+                 * been SM.
+                 */
+                bit spec_modified = 0;
+                for (kdx = jdx-1; kdx >=0; kdx--) /* To Me:
+                                                   * Trace_Q_Arr[addr].at(q_size-1)
+                                                   * In this UPDATE, the transaction may
+                                                   * not be the latest one. 
+                                                   */
+                {
+      
+                  Trace_trans older_trans = Trace_Q_Array[addr].at(kdx);
+                  if (older_trans.senderID != old_trans.senderID)
+                    continue;
+                  if (older_trans.operation != S_STORE && older_trans.operation != RAW_STORE)
+                    continue;
+                  if (older_trans.data != old_trans.data)
+                    continue;
+                  spec_modified = 1;
+                  break;
+                }
+                if (spec_modified){
+                  if (_DEBUG_){
+                    printf("SCOREBOARD INFO: Proc %d's transaction at 0x%x could have violated by proc %d, but wasn't dirty\n"
+                           "SCOREBOARD INFO: Proc %d had already speculatively modified that address\n",
+                           old_trans.senderID, old_trans.destinationAddr, store_trans.senderID, old_trans.senderID);
+                  }
+                  continue;
+                }
+              }
+            }
+            tcc = Tcc_Array[old_trans.senderID/CPUS_PER_TILE];
+            if (!tcc.valid){
+              printf("SCOREBOARD ERROR, transactional Trace_trans held by invalid TCC transaction... something's wrong in SB\n");
+              scoreboard_fail();
+              UpdateAfterTCCCommit = 1;
+              return;
+            }
+            if (tcc.can_commit == 1){
+              printf("SCOREBOARD INFO: Proc %d's transaction first violated by TCC Commit from %d at (physical) address 0x%x.\n",
+                     old_trans.senderID,
+                     store_trans.senderID,
+                     old_trans.destinationAddr);
+            }
+                   
+            tcc.can_commit = 0;
+          } /*if a load*/
+        } /*if a transactional op*/
+      } /*else*/
+    } /*for loop over each xaction at this address.*/
+    /*finally, there may be outstanding loads that have not been seen by the
+     * scoreboard. Invalidate those as well.*/
+    for ( idx = 0; idx < num_cpus; idx++){
+      /*if the address is locked for that CPU, and the corresponding TCC thing is
+       * valid, mark it as possibly violated.
+       */
+      if (Trace_Q_Array[addr].isLockedFor (idx)){
+        TCC_Transaction tcc = Tcc_Array[idx/CPUS_PER_TILE];
+        if (tcc.can_violate == 0){
+          printf(" SCOREBOARD INFO: Proc %d's transaction *may* be  violated by TCC Commit from "
+                 "%d at (physical) address 0x%x (load is outstanding at commit time).\n",
+                 idx, store_trans.senderID, addr);
+        }
+        tcc.can_violate = 1;
+      }
+    }
+  } /*assoc_index check*/
+  else
+          
+  {
+    printf("t=%d, SCOREBOARD WARNING: UpdateAfterTCCCommit called when relevant queue "
+           "did not exist."
+           " Address=0x%8x, Data=0x%8x\n", get_cycle(),
+           store_trans.destinationAddr, store_trans.data);
+    UpdateAfterTCCCommit = 0;
+    return;
+  }
+
+  if (_DEBUG_ > 15 && addr == INTERESTING){
+    fprintf(Scoreboard_log_file_handle, "AFTER UPDATE AFTER TCC COMMIT:\n");
+    Trace_Q_Array[addr].logMeToFile(Scoreboard_log_file_handle);
+    fprintf(Scoreboard_log_file_handle, "\n************************\n");
+  }     
+ 
+  UpdateAfterTCCCommit = 0;  
+}
+
+
+
+
+//-------------------------------------------------------------------------
+//---------------------- UNUSED Update tasks/functions
+//-------------------------------------------------------------------------
+
+/* UpdateAfterReadGC (UNUSED):
+ * when all processors have completed a read to an address, we have
+ * invalidated earlier stores other than those read. So we can
+ * then GC them. this function will update the structures needed
+ * to check if all processors have read from this adress, then if
+ * all processors have read from it, it will GC the invalid stores.
+ */
+
+function integer Scoreboard::UpdateAfterReadGC(Trace_trans read_trans)
+{
+  bit[31:0] addr = read_trans.destinationAddr;
+  integer q_size = 0;
+  integer done = 0;
+  bit[63:0] invalidate_time = 0;
+  Trace_trans old_trans;
+
+  if (read_trans.operation != S_LOAD){
+    UpdateAfterReadGC = 0;
+    return;
+  }
+
+  if (assoc_index(CHECK, Trace_Q_Array, addr) && (Trace_Q_Array[addr] != null)){
+
+    Trace_Q_Array[addr].addHasBeenReadBy(read_trans.senderID, read_trans.timeStart);
+    if (Trace_Q_Array[addr].hasBeenReadByAll()){
+      if (_DEBUG_) printf("Scoreboard: Garbage Collecting");    
+      invalidate_time = Trace_Q_Array[addr].getMinLastReadTime();
+      while (1){
+        old_trans = Trace_Q_Array[addr].front();
+        if (old_trans.getMaxIsValidForCPU() < invalidate_time){
+          old_trans = Trace_Q_Array[addr].pop_front();
+          if (_DEBUG_)printf("GCed old transaction by id %d, addr 0x%x, data 0x%x\n",
+                             old_trans.senderID, old_trans.destinationAddr, old_trans.data);
+        }         
+        else{
+          break;
+        }                   
+      }   
+      Trace_Q_Array[addr].resetHasBeenReadBy();
+    }
+  }
+  else{
+    printf("t=%d, SCOREBOARD ERROR: UpdateAfterReadGC called before relevant queue existed."
+           " Address=0x%8x, Data=0x%8x\n", get_cycle(),
+           read_trans.destinationAddr, read_trans.data);
+    UpdateAfterReadGC = 1;
+    return;
+  }
+  UpdateAfterReadGC = 0;
+  return;
+}       
+
+//-------------------------------------------------------------------------
+//---------------------- Auxiliary tasks/functions
+//-------------------------------------------------------------------------
+
+/****************************************************************************/
+/*HandleSpecCmd -
+ * The processor can generate special commands, specifically to notify that
+ * a transaction has begun, committed, or cancelled. This function handles these
+ * various cases.
+ */
+
+function bit Scoreboard::HandleSpecCmd(Trace_trans specTrans){
+
+  bit err = 0;
+  /*check input*/
+  if (_DEBUG_){
+    printf("Handling SPEC_CMD\n");
+  }
+  if (specTrans == null){
+    printf("SCOREBOARD ERROR: specTrans is null in HandleSpecCmd\n");
+    exit (1);
+  }
+
+  if (specTrans.operation != SPEC_CMD){
+    printf("SCOREBOARD ERROR: specTrans operation is not SPEC_CMD\n");
+    exit (1);
+  }
+  
+  case(specTrans.destinationAddr){
+    START_TRANSACTION:{
+      err = HandleTccStart(specTrans);
+    }
+    END_OVERHEAD_START_TRANSACTION:{
+      err = HandleTccStart(specTrans);
+    }
+    START_COMMIT:{        
+      err = HandleTccCommitStart(specTrans);
+    }
+    END_COMMIT:{
+      err = HandleTccCommitEnd(specTrans);
+    }
+    VIOLATE_TRANSACTION:{
+      err = HandleTccViolation(specTrans);
+    }
+    END_TRANSACTION:{
+      err = HandleTccEnd(specTrans);
+    }
+    END_COMMIT_END_TRANSACTION:{
+      err = HandleTccCommitEnd(specTrans);
+      err |= HandleTccEnd(specTrans);
+    }
+    
+    default:
+    err = 0;
+  }
+
+  if (err){
+    //printf("SCOREBOARD ERROR: Error in HandleSpecCmd\n");
+    scoreboard_fail();
+  }
+}
+
+/*--------------------------------------------------------------------------------
+ * HandleTccStart -
+ * This function initiates a transaction in the scoreboard.
+ * It will fail if the processor already has a transaction (because
+ * SM does not support nested transactions.
+ * Otherwise, it simply sets the transaction to be VALID.
+ */
+
+function bit Scoreboard::HandleTccStart(Trace_trans specTrans){
+
+  if (specTrans == null){
+    HandleTccStart = 1;
+    printf("SCOREBOARD ERROR, specTrans is null in HandleTccStart. (TCC)\n");
+    return;
+  }
+  if (specTrans.senderID < num_cpus){
+    if (Tcc_Array[specTrans.senderID/CPUS_PER_TILE].valid){
+      HandleTccStart = 1;
+      if (Scoreboard_log_file_handle){
+        fprintf(Scoreboard_log_file_handle,
+                "SCOREBOARD ERROR, the TCC transaction for %d was already valid in call to \n"
+                " \tHandleTccStart: \n", specTrans.senderID);
+        Tcc_Array[specTrans.senderID/CPUS_PER_TILE].LogMeToFile(Scoreboard_log_file_handle);
+      }
+      printf("%d: SCOREBOARD ERROR: the TCC transaction for %d was already valid in call to HandleTccStart. Probably START_TRANSACTION spec_cmd was called twice before a VIOLATE_TRANSACTION or COMMIT_TRANSACTION\n", get_cycle(), specTrans.senderID);
+      return;
+    }
+    Tcc_Array[specTrans.senderID/CPUS_PER_TILE].valid = 1;
+  }
+  if (_DEBUG_){
+    printf("Handling TCC Start from %d\n", specTrans.senderID);
+    fprintf(Scoreboard_log_file_handle,
+            "%d: TCC START from %d\n", get_cycle(),
+            specTrans.senderID);
+  }
+  HandleTccStart = 0;
+}
+
+/*----------------------------------------------------------------------
+ * HandleTccCommitStart
+ * The point of this function is to allow processors
+ * to read the values in the committing transaction. It
+ * also sets the start time of the stores (but I'm not
+ * quite sure if this is necessary).
+ */
+function bit Scoreboard::HandleTccCommitStart(Trace_trans specTrans){
+  TCC_Transaction tcc;
+  integer ii, jj;
+  if (specTrans.senderID >= num_cpus){
+    HandleTccCommitStart = 0;
+    return;
+  }
+  if (_DEBUG_){
+    printf("Handling TCC commit start from %d\n", specTrans.senderID);
+    fprintf(Scoreboard_log_file_handle, "%d: TCC COMMIT START from %d\n",
+            get_cycle(), specTrans.senderID);
+ } 
+  tcc = Tcc_Array[specTrans.senderID/CPUS_PER_TILE];
+  /*There needs to be a transaction in order for it to commit.*/
+  if (!tcc.valid){
+    printf("%d, SCOREBOARD ERROR, There is no valid TCC transaction in call to TccCommitStart for proc. %d. Probably START_TRANSACTION spec_cmd was not called before COMMIT_START.\n", get_cycle(), specTrans.senderID);
+    scoreboard_fail();
+    HandleTccCommitStart =1;
+    return;
+  }
+  /*If this is already committing, then this shouldn't get called again.*/
+  if (tcc.committing){
+    printf("%d: SCOREBOARD ERROR, TccCommit called when the TCC Transaction was already comitting. Probably START_COMMIT spec_cmd was called twice before END_COMMIT or VIOLATE_TRANSACTION\n", get_cycle());
+    scoreboard_fail();
+    HandleTccCommitStart = 1;
+    return;
+  }
+  /*if this can't commit, then we shouldn't do anything in the scoreboard.
+   * The commit arbitration should invalidate this transaction.
+   */
+  if (!tcc.can_commit){
+    if (_DEBUG_){       
+      printf("%d: SCOREBOARD INFO: TCC Commit called for TCC %d, but it has been violated, not allowing commit (Scoreboard will complain if it sees COMMIT_END instead of VIOLATE_TRANSACTION).\n",
+             get_cycle(), tcc.proc);
+    }
+    HandleTccCommitStart = 0;
+    return;
+  }
+
+  /*ok, this transaction may begin committing at this point.
+   * so, we should set the valid times for the other procesors now.
+   * but. this doesn't affect any other stores. One thing
+   * to note is that there may be multiple stores to the
+   * same address. We only want the first one (most_recent_store),
+   * which is noted by seeing if this is valid for this CPU until
+   * infinity.
+   */
+  for (ii = tcc.ttQ.size()-1; ii >= 0; ii--){
+    
+   Trace_trans t = tcc.ttQ[ii];
+   bit most_recent_store = (t.is_valid_for_cpu[(specTrans.senderID/CPUS_PER_TILE)*CPUS_PER_TILE]
+                            == INFINITY);
+   /*it is possible that we already called commit start & end once, and
+    * this transaction has already gone through all this stuff. if so,
+    skip it.*/
+   if (!t.transactional){
+     continue;
+   }
+   if (_DEBUG_ > 20){
+     fprintf(Scoreboard_log_file_handle, "TCC WHILE  TCC START COMMIT for %d:\n", t.senderID);
+     tcc.LogMeToFile(Scoreboard_log_file_handle);
+     fprintf(Scoreboard_log_file_handle, "\n************************\n");
+   }
+   
+   /*This store really begins at this time.*/
+   t.timeStart = specTrans.timeStart;
+   t.timeEnd = INFINITY;
+   if (_DEBUG_ > 15 && t.destinationAddr == INTERESTING){
+     fprintf(Scoreboard_log_file_handle, "BEFORE  TCC START COMMIT for %d:\n", t.senderID);
+     Trace_Q_Array[t.destinationAddr].logMeToFile(Scoreboard_log_file_handle);
+     fprintf(Scoreboard_log_file_handle, "\n************************\n");
+   }
+   if (most_recent_store){
+     integer q_size, jdx;
+     Trace_trans old_trans;
+     for (jj = 0; jj < num_cpus; jj++){
+       t.is_valid_for_cpu[jj] = INFINITY;
+     }
+     /*mark any instructions which have read from this address that they
+      * may be violated (depending on order)
+      */ 
+     if (!assoc_index(CHECK, Trace_Q_Array, t.destinationAddr)){
+       printf("SCOREBOARD ERROR: (Problem with scoreboard): There is a transaction stored in TCC structuture for proc %d, which is not stored in the scoreboard itself:\n", t.senderID);
+       t.LogMeToFile(stdout);
+       scoreboard_fail();
+       return;
+     }
+     q_size = Trace_Q_Array[t.destinationAddr].size();
+
+     // Now look at all earlier transactions
+     for (jdx = q_size-1; jdx >=0; jdx--) /* To Me:
+                                           * Trace_Q_Arr[addr].at(q_size-1)
+                                           * In this UPDATE,
+                                           * the transaction may
+                                           * not be the latest one. 
+                                           */
+    {
+      old_trans = Trace_Q_Array[t.destinationAddr].at(jdx);
+
+      // invalidate old stores of the same origin, or those sent by environment,
+      //or those where there just is no race (too far apart).
+      if (t == old_trans){
+        continue;
+      }
+      if (old_trans.transactional){
+        /*this is a transactional load to the same address... or it should be.*/
+        if (old_trans.operation == S_LOAD || old_trans.operation == RAW_LOAD){
+          /*flag that the corresonpding transaction COULD be violated.*/
+          TCC_Transaction tcc  = Tcc_Array[old_trans.senderID/CPUS_PER_TILE];
+            if (!tcc.valid){
+              printf("%d: SCOREBOARD ERROR, transactional Trace_trans held by invalid TCC transaction (TCC%d)... something's wrong in SB\n", get_cycle(), tcc.proc);
+              HandleTccCommitStart = 1;
+              scoreboard_fail();
+              return;
+            }
+            tcc.can_violate = 1;
+            /*For loads, set a "dirty" bit. This load happened BEFORE a commit start, so they will
+             *have to indicate a violation if this transaction completes sucessfully.
+             * These should be CLEARED if this transaction eventually violates!
+             */
+            old_trans.is_valid_for_cpu[t.senderID/CPUS_PER_TILE] = 1;
+        }
+      }/*if a transactional load*/
+    }/*for each transaction at this address*/
+    if (_DEBUG_ >15 && t.destinationAddr == INTERESTING){
+      fprintf(Scoreboard_log_file_handle, "AFTER  TCC START COMMIT for %d:\n", t.senderID);
+     Trace_Q_Array[t.destinationAddr].logMeToFile(Scoreboard_log_file_handle);
+     fprintf(Scoreboard_log_file_handle, "\n************************\n");
+  }
+   }    
+   
+  }
+  tcc.committing = 1;
+  HandleTccCommitStart = 0;
+}
+
+/*----------------------------------------------------------------
+ *HandleTccCommitEnd
+ * The purpose of this function is to handle the completion of a TCC
+ * Transaction. The outcome of this is that:
+ *    - The committed stores should be visible to all
+ *      processors (this already happened in the first part of
+ *      commit. But now, any earlier stores are invalid for
+ *      all processors, except maybe the xactional kind.) 
+ *    - The loads should be removed (invalidated so the GC picks them up)
+ *    - Any loads made by another TCC transaction to any address
+ *      which we are writing to need to be flagged as unable to commit.
+ *    
+ */
+function bit Scoreboard::HandleTccCommitEnd(Trace_trans specTrans){
+  integer ii;
+  TCC_Transaction tcc;
+  if (specTrans.senderID >= num_cpus){
+    HandleTccCommitEnd = 0;
+    return;
+  }
+  if (_DEBUG_){
+    printf( "t=%d , Handling TCC Commit End from %d\n", get_cycle(), specTrans.senderID);
+    fprintf(Scoreboard_log_file_handle, "%d: TCC COMMIT END: proc %d\n", get_cycle(), specTrans.senderID);
+  }
+  tcc = Tcc_Array[specTrans.senderID/CPUS_PER_TILE];
+  if (!tcc.valid){
+    printf ("%d: SCOREBOARD ERROR, No valid TCC transaction for proc %d in call to HandleTccCommitEnd (probably START_TRANSACTION has not been called)\n", get_cycle(), specTrans.senderID);
+    HandleTccCommitEnd = 1;
+    scoreboard_fail();
+    return;
+  }
+  if (!tcc.committing){
+    printf ("%d: SCOREBOARD ERROR, TCC transaction for %d was not committing in call to HandleTccCommitEnd: probably COMMIT_START spec_cmd was never called, or the scoreboard thinks this transaction should have been VIOLATEd.\n", get_cycle(), specTrans.senderID);
+    HandleTccCommitEnd = 1;
+    scoreboard_fail();
+    return;
+  }
+  /*This should not be able to commit successfully if it was violated.*/
+  if (!tcc.can_commit){
+    printf("%d, SCOREBOARD ERROR, TCC transaction from %d is committing when it was violated earlier, probably COMMIT_END was called when the scoreboard thinks the transaction can not complete.\n", get_cycle(), specTrans.senderID);
+    HandleTccCommitEnd = 1;
+    scoreboard_fail();
+    return;
+  }
+  /*Ok, allow this to commit.*/
+  /*First, this is a store that has completed. This is similar to the case
+   * for completed sync ops.
+   */
+
+  for (ii = tcc.ttQ.size()-1; ii >= 0; ii --){
+    Trace_trans t = tcc.ttQ[ii];
+    bit most_recent_store;
+    /*it is possible that this transaction has already committed due to overflows. Skip it if so*/
+    if (!t.transactional){
+      continue;
+    }
+    if (_DEBUG_ > 15){
+      if (t.destinationAddr == INTERESTING){
+        fprintf(Scoreboard_log_file_handle, " TCC for  %d while UPDATE AFTER TCC COMMIT:\n", specTrans.senderID);
+        tcc.LogMeToFile(Scoreboard_log_file_handle);
+        fprintf(Scoreboard_log_file_handle, "\n************************************\n");
+      }
+    }
+    most_recent_store = (t.is_valid_for_cpu[specTrans.senderID]
+                             == INFINITY);
+    if (most_recent_store){
+      if (t.operation == S_STORE || t.operation == RAW_STORE){
+        t.timeEnd = specTrans.timeStart;
+        if (UpdateAfterTCCCommit(t)){
+          HandleTccCommitEnd = 1;
+          scoreboard_fail();
+        }
+      }
+    }
+    t.transactional = 0;
+  }
+  /*Do this in END*/
+  //tcc.reset();
+  tcc.committing = 0;
+  HandleTccCommitEnd = 0;
+}
+
+/*-------------------------------------------------------------------------
+ *HandleTccViolaton
+ *In a Tcc violation, the main function is to delete the transactions
+ * from the scoreboard. This is done by invalidating them and letting the
+ * GC take care of them.
+ */
+ 
+function bit Scoreboard::HandleTccViolation(Trace_trans specTrans){
+  integer ii;
+  TCC_Transaction tcc;
+  
+  if (specTrans.senderID >= num_cpus){
+    HandleTccViolation = 0;
+    return;
+  }
+  if (_DEBUG_){
+    printf("%d: Handling TCC Violation from %d\n", get_cycle(), specTrans.senderID);
+    fprintf(Scoreboard_log_file_handle, " %d: TCC VIOLATION from %d\n", get_cycle(), specTrans.senderID);
+  }
+  /*There needs to be a transaction in order for it to be violated...*/
+  tcc = Tcc_Array[specTrans.senderID/CPUS_PER_TILE];
+  if (!tcc.valid){
+    printf("%d: SCOREBOARD WARNING, TCC transaction violation for proc. %d when there was no valid TCC transaction. Probably START_TRANSACTION was not called before VIOLATE_TRANSACTION\n",get_cycle(), specTrans.senderID);
+    tcc.LogMeToFile(stdout);
+    //scoreboard_fail();
+    HandleTccViolation = 0;
+    return;
+  }
+
+  /*There shouldn't be a violation for no reason.*/
+  if (tcc.can_commit & !tcc.can_violate){
+    printf("%d, SCOREBOARD ERROR, TCC transaction violation reported for proc %d when there were no memory collisions. Scoreboard sees VIOLATE_TRANSACTION when it thinks the transaction should not be violated. (Performance bug?)\n", get_cycle(), specTrans.senderID);
+    scoreboard_fail();
+    /*allow the xaction to abort anyway (don't return);*/
+  }
+
+  /*Abort means that all xactions should be deleted. One way to do it is
+   * to actually delete them from the queue. But that would be a pain.
+   * Instead, just set them all to have 0 valid times and set them as
+   * non transactional. The garbage collector will get them.
+   */
+
+
+  /*if this transaction was committing, we need to
+   * make sure that we clear the dirty bits.
+   */
+  if(tcc.committing){
+    for (ii = tcc.ttQ.size()-1; ii >= 0; ii--){
+      Trace_trans t = tcc.ttQ[ii];
+      Trace_trans old_trans;
+      integer q_size = Trace_Q_Array[t.destinationAddr].size();
+      integer jdx;
+      // Now look at all earlier transactions
+      for (jdx = q_size-1; jdx >=0; jdx--) /* To Me:
+                                            * Trace_Q_Arr[addr].at(q_size-1)
+                                            *In this UPDATE, the transaction may
+                                            * not         be the latest one. 
+                                            */
+      {   
+        old_trans = Trace_Q_Array[t.destinationAddr].at(jdx);
+        // invalidate old stores of the same origin, or those sent by environment,
+        //or those where there just is no race (too far apart).
+        if (t == old_trans){
+          continue;
+        }
+        if (old_trans.transactional){
+          /*this is a transactional load to the same address... or it should be.*/
+          if (old_trans.operation == S_LOAD || old_trans.operation == RAW_LOAD){
+            /*For loads, clear a "dirty" bit. 
+             */
+            old_trans.is_valid_for_cpu[t.senderID/CPUS_PER_TILE] = 0;
+          }            
+        }/*if a transactional load*/
+      }/*for each transaction at this address*/
+    }/*for each address in this transactional*/
+  }/*if we were committing (need to clear the dirty bits)*/        
+   
+  for (ii = 0; ii < tcc.ttQ.size(); ii++){
+    Trace_trans t = tcc.ttQ[ii];
+    t.is_valid_for_cpu[specTrans.senderID] = 0;
+    t.transactional = 0;
+    t.locked = 0;
+  }
+
+  tcc.reset();
+  HandleTccViolation = 0;
+}
+
+
+/*----------------------------------------------------------------
+ *HandleTccEnd
+ * The purpose of this function is to handle the completion of a TCC
+ * Transaction. This marks the end of the transaction and retires the tcc structure.
+ * There may be multiple commit pairs before this.
+ *    
+ */
+function bit Scoreboard::HandleTccEnd(Trace_trans specTrans){
+  integer ii;
+  TCC_Transaction tcc;
+  if (specTrans.senderID >= num_cpus){
+    HandleTccEnd = 0;
+    return;
+  }
+  if (_DEBUG_){
+    printf( "t=%d , Handling TCC END from %d\n", get_cycle(), specTrans.senderID);
+    fprintf(Scoreboard_log_file_handle, "%d: TCC END: %d\n", get_cycle(), specTrans.senderID);
+  }
+  tcc = Tcc_Array[specTrans.senderID/CPUS_PER_TILE];
+  if (!tcc.valid){
+    printf ("%d: SCOREBOARD ERROR, No valid TCC transaction for proc %d in call to HandleTccEnd (probably END_TRANSACTION was called before START_TRANSACTION)\n", get_cycle(), specTrans.senderID);
+    HandleTccEnd = 1;
+    scoreboard_fail();
+    return;
+  }
+
+  if (tcc.committing){
+    printf ("%d: SCOREBOARD ERROR, TCC transaction for proc. %d was still committing in call to HandleTccEnd (probably END_COMMIT was not called before END_TRANSACTION)\n", get_cycle(), specTrans.senderID);
+    HandleTccEnd = 1;
+    scoreboard_fail();
+    return;
+  }
+
+  for (ii = 0; ii < tcc.ttQ.size(); ii++){
+    Trace_trans t = tcc.ttQ[ii];
+    t.locked = 0;
+  }
+  tcc.reset();
+    
+  HandleTccEnd = 0;
+}
+
+/* --------------------------------------------------------------------------
+ * GarbageCollector:
+ * every 1000 cycles or so, fire the garbage collector to
+ * clean up old invalidated transaction*/
+
+task Scoreboard::GarbageCollector(){
+  integer i;
+  integer jdx;
+  integer proc;
+  integer qidx;
+  integer num_queues;
+  integer max_queue_size;
+  integer total_queue_sizes;
+  integer gc_counts = 0;
+  integer store_q;
+  while (active){
+    i = 0;
+    num_queues = 0;
+    max_queue_size = -1;
+    total_queue_sizes = 0;
+  
+    /*what is the "repeat" syntax?*/
+    repeat(1000)  @(posedge CLOCK);
+
+    
+    
+    semaphore_get(WAIT, semID, 1);     
+    if (_DEBUG_){
+      printf("Garbage Collecting Scoreboard...\n");
+    }
+    /*For every address, delete invalid transactions.
+     * (not anymore)leave the last 20 or so for readability
+     */
+    /*what is the earliest last transaction (some processors
+      may have done a last transaction earlier than others)
+    */
+  
+    /*invalidate_time = INFINITY;
+      for (proc = 0; proc < num_cpus; proc ++){
+      if (last_transaction_time[proc] < invalidate_time){
+      invalidate_time = last_transaction_time[proc];
+      }
+      }
+    */
+    invalidate_time = get_cycle();
+    if (_DEBUG_){
+      printf("Invalidate time is %d\n", invalidate_time);
+    }
+
+    /*Clean up the store queues... any stores which
+     * have completed can be removed from those.
+     */
+    for (store_q = 0; store_q < num_cpus; store_q++){
+      Trace_trans store_trans;
+      Store_Queue sq = Store_Queues[store_q];
+      for (jdx = 0; jdx < sq.ttQ.size(); jdx++){
+        store_trans = sq.ttQ[jdx];
+        if (store_trans.timeEnd < invalidate_time){
+          sq.ttQ.delete(jdx);
+          jdx--;
+        }
+      }
+    }
+      
+    
+    foreach(Trace_Q_Array, qidx){
+      Trace_trans_Q q;
+
+      Trace_trans trac_to_gc;
+      q = Trace_Q_Array[qidx];
+      if (q == null){
+        continue;
+      }
+      num_queues++;
+      if (q.isLocked()){continue;}
+      if (_DEBUG_){
+        printf("GCing queue at %x\n", qidx);
+      }
+      
+      if (_DEBUG_){
+        printf("# of transactions in queue:\n");
+        printf("\t%d\n",q.size());
+      }
+      if ((qidx & 32'h3 )==0){
+        //q.cleanUpBefore(invalidate_time);
+      }
+      for (jdx = 0; jdx < q.size(); jdx++){
+        trac_to_gc = q.at(jdx);
+        /*always remove the reads*/
+        if ((trac_to_gc.operation == S_STORE)
+            ||(trac_to_gc.operation == SYNCH_STORE)
+            ||(trac_to_gc.operation == RAW_STORE)
+            ||(trac_to_gc.operation == SET_STORE)){
+          if (!trac_to_gc.transactional && !trac_to_gc.locked &&
+              trac_to_gc.getMaxIsValidForCPU() <= invalidate_time){
+            if (_DEBUG_) {
+              printf("Garbage collecting:\n");
+              trac_to_gc.LogMeToFile(stdout);
+            }
+            trac_to_gc.transactional = 0;
+            trac_to_gc.locked = 0;
+            Trace_trans_Freelist.push_front(trac_to_gc);
+            q.delete(jdx);
+            jdx--;
+          }
+        }
+        else if (!trac_to_gc.transactional && !trac_to_gc.locked){
+          if (_DEBUG_){
+            printf("Garbage collecting:\n");
+            trac_to_gc.LogMeToFile(stdout);
+          }
+          trac_to_gc.transactional = 0;
+          trac_to_gc.locked = 0;
+          Trace_trans_Freelist.push_front(trac_to_gc);
+          q.delete(jdx);
+          jdx--;
+        }
+      }
+      /*update metrics*/
+      if (q.size() > max_queue_size){
+        max_queue_size = q.size();
+      }
+      total_queue_sizes += q.size();
+
+      /*is there only one xaction in the queue? and is it
+       * super-old? put it into backup and put the queue away.
+       */
+      if (q.size() ==1){
+        Trace_trans last_trac = q.at(0);
+        if (last_trac.timeStart + MaxStoreTime < invalidate_time){
+          BackupMem[last_trac.destinationAddr] = last_trac.data;
+          q.delete(0);
+          q.setImpossibleEmptyAfter(0);
+          q.setImpossibleFullAfter(0);
+          Trace_Q_Freelist.push_front(q);
+          Trace_Q_Array[qidx] = null;
+          assoc_index(DELETE, Trace_Q_Array, qidx);
+        }
+      }
+          
+    }
+
+    if (Scoreboard_usage_file_handle){
+      fprintf(Scoreboard_usage_file_handle, " %d, %d, %d, %d\n", get_cycle(),
+              max_queue_size, total_queue_sizes, num_queues);
+    }
+    
+    gc_counts ++;
+    if (_DEBUG_ ){
+      printf("Done Garbage Collecting Scoreboard.\n");
+    }
+
+    if (gc_counts > 50 && _DEBUG_ > 5){
+      fprintf(Scoreboard_log_file_handle,"\n\n\nScoreboard dump-out (every 500000 cycles)\n");
+      foreach (Trace_Q_Array, qidx){
+        if (Trace_Q_Array[qidx] != null){
+          fprintf(Scoreboard_log_file_handle, " \n\n Current Queue at 0x%x\n", qidx);
+          Trace_Q_Array[qidx].logMeToFile(Scoreboard_log_file_handle);
+        }      
+      }        
+      fprintf(Scoreboard_log_file_handle, "\n\n\n");
+      gc_counts = 0;
+    }     
+    
+    /*       
+    if (num_queues > 10000){
+      
+      foreach (Trace_Q_Array, qidx){
+        if (Trace_Q_Array[qidx] != null){
+          fprintf(Scoreboard_log_file_handle, " \n\n Current Queue at 0x%x", qidx);
+          Trace_Q_Array[qidx].logMeToFile(Scoreboard_log_file_handle);
+        }
+      }
+      semaphore_put(semID, 1);
+      exit(1);
+    }
+    */
+    semaphore_put(semID, 1);
+  }
+}
+          
+
+
+
+//-------------------------------------------------------------------------
+task Scoreboard::scoreboard_fail(){
+  
+//  printf("%d: SCOREBOARD WARNING/SCOREBOARD ERROR! Not necessarily exiting!\n", get_cycle());
+  if (_DEBUG_ > 10){    
+    exit(1);    
+  }
+}
+
+
+
+//-------------------------------------------------------------------------
+function Trace_trans Scoreboard::getNewTraceTrans(){
+  if (Trace_trans_Freelist.size() == 0){
+    getNewTraceTrans = new(num_cpus);
+  }
+  else{
+    Trace_trans recycled_trans = Trace_trans_Freelist.pop_front();
+    /*need to reset the valid-until, since assign values doesn't do anything for this.*/
+    integer idx;
+    for (idx=0;idx<num_cpus;idx++)
+      recycled_trans.is_valid_for_cpu[idx] = INFINITY;
+    getNewTraceTrans = recycled_trans;
+  }
+}
+
+//-------------------------------------------------------------------------
+function Trace_trans_Q Scoreboard::getNewTraceTransQ(bit[31:0] addr,
+                                                     bit readFromBackup)
+{
+  /*Plant an initial value, read from Main Memory.*/
+  Trace_trans initial;
+  
+  bit[31:0] initial_word;
+  bit[5:0] meta;
+  bit[7:0] initial_byte;
+  bit[63:0] time;
+  /*this is a word-level read, so the last 2 bits do not matter*/
+  initial = getNewTraceTrans();
+  if (readFromBackup){
+    initial_byte = BackupMem[addr];
+  }
+  else{
+    MainMem.ReadData(addr,initial_word,
+                     meta, "(read by Trace_trans_Q::new())");
+    case (addr[1:0]){
+      0: initial_byte = initial_word[7:0];
+      1: initial_byte = initial_word[15:8];
+      2: initial_byte = initial_word[23:16];
+      3: initial_byte = initial_word[31:24];
+    }
+  }
+  
+  initial.AssignValues(SCOREBOARD_ID,
+                       addr,
+                       initial_byte,
+                       0, //this is the memory at time 0
+                       0,
+                       S_STORE,
+                       "(S_STORE trans planted when queue was initialized)");
+  
+  
+  if (Trace_Q_Freelist.size() == 0){
+    getNewTraceTransQ = new (_DEBUG_, addr, initial, num_cpus);
+  }
+  else{
+    Trace_trans_Q q = Trace_Q_Freelist[0];
+    q.reset(addr, initial);
+    getNewTraceTransQ = Trace_Q_Freelist.pop_front();
+  }
+}
+
+#endif // end of INC_SCOREBOARD_VR

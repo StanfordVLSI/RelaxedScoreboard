@@ -1,0 +1,79 @@
+#ifndef INC_SCOREBOARD_ADDRESS
+#define INC_SCOREBOARD_ADDRESS
+
+//////////////////////////////////////////////////////////////////////////////
+// File name: ScoreboardAddress.vr
+//
+// This file contains a structure that holds
+// addresses that the scoreboard user wishes to
+// ignore (have the scoreboard not check).
+//////////////////////////////////////////////////////////////////////////////
+
+//------------------------------------------------------------------------------
+//----- Include Related Files Here
+//------------------------------------------------------------------------------
+// Main source file for tile testbench
+
+// declare external tasks/classes/functions here if necessary
+
+//------------------------------------------------------------------------------
+//----- Place Special Definitions Here
+//------------------------------------------------------------------------------
+
+// --- Some of the definitions are placed in FromTheVerilog_defs.vrh
+
+//------------------------------------------------------------------------------
+//----- Place Auxiliary Classes Here
+//------------------------------------------------------------------------------
+class Scoreboard_Address
+{
+
+  integer _DEBUG_;
+  bit[31:0] highs[$];
+  bit[31:0] lows[$];
+  string my_name;
+  // Constructor 
+  //-------------
+  task new(integer _DEBUG, string name);
+
+  task addRange(bit[31:0] low, bit[31:0] high);
+  function bit fallsInRange(bit[31:0] address);
+
+  task logMeToFile(integer fd);
+}
+//----------------------------------------
+task Scoreboard_Address::new(integer _DEBUG, string name)
+{
+  _DEBUG_ = _DEBUG;
+  my_name = name;
+}
+
+task Scoreboard_Address::addRange(bit[31:0] low, bit[31:0] high){
+  lows.push_back(low);
+  highs.push_back(high);
+}
+
+function bit Scoreboard_Address::fallsInRange(bit[31:0] address){
+  integer idx;
+  fallsInRange = 0;
+  for (idx = 0; idx < highs.size(); idx++){
+    if ((address >= lows[idx]) && (address <= highs[idx])){
+      fallsInRange = 1;
+      break;
+    }
+  }
+  return;
+}
+
+task Scoreboard_Address::logMeToFile(integer fd=0){
+  if (fd == 0){
+    return;
+  }
+  else{ 
+    integer jdx;
+    for (jdx = 0; jdx < highs.size(); jdx++){
+      fprintf(fd, "%s: 0x%x to 0x%x\n", my_name, lows[jdx], highs[jdx]);
+    }
+  }
+}
+#endif
