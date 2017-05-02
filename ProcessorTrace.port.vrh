@@ -1,0 +1,48 @@
+/*************************************************************************
+ ** From Perforce:
+ **
+ ** $Id: //Smart_design/Smash_rel/TestCommonLib/Processor/ProcessorTrace/ProcessorTrace.port.vrh#1 $
+ ** $DateTime: 2008/01/04 23:17:34 $
+ ** $Change: 6220 $
+ ** $Author: zasgar $
+ *************************************************************************/
+
+
+//------------------------------------------------------------------------------
+//---- Declaretion of the virtual ports 
+//------------------------------------------------------------------------------
+// Define a virtual port type here, that will correspond to PROCESSORTRACE_IF:
+// (only defined once)
+#ifndef PROCESSOR_TRACE_VIRTUAL_PORT
+#define PROCESSOR_TRACE_VIRTUAL_PORT
+
+port ProcessorTrace_IF_port
+{
+  CLK;
+  BReset;
+  PDebugStatus;
+  PDebugPC;
+  PDebugData;
+  PDebugLS0Stat;
+  PDebugLS0Addr;
+  PDebugLS0Data;
+  IRam0Addr;
+  IRam0Data;
+  IRam0WrData;
+  IRam0LoadStore;
+  IRam0Wr;
+  IRam0En;
+  IRam0WordEn;
+  IRam0Busy;
+  DRam0En0;
+  DRam0Addr0;
+  DRam0Wr0;
+  DRam0WrData0;
+  DRam0Data0;
+  DRam0ByteEn0;
+  TIE_MemOp_Out_Req;
+  TIE_MemOp_Out;
+  TIE_MemOp_In;
+}
+
+#endif

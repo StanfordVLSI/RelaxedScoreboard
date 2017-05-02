@@ -1,0 +1,68 @@
+/*************************************************************************
+ ** From Perforce:
+ **
+ ** $Id: //Smart_design/Smash/TestCommonLib/Processor/ProcessorTrace/ProcessorTrace.if.vrh#2 $
+ ** $DateTime: 2006/09/26 09:31:36 $
+ ** $Change: 2548 $
+ ** $Author: shacham $
+ *************************************************************************/
+
+/* *****************************************************************************
+ *  Comments on this file:
+ *  1. 	For shim and tile/smash gate level, the PDebug port of the processcor
+ *	don't exists so don't try to connect them. The relevant flag is 
+ *	NO_TRACE_PORT_MONITOR.
+ *  2. 	For Post place and route (PANDR) runs, none of the processor 
+ *  	signals exists, so don't try to connect them. The relevant flag is 
+ *	PANDR
+ ******************************************************************************/
+
+
+// default name for interface:
+#ifndef PROCESSORTRACE_IF
+#define PROCESSORTRACE_IF ProcessorTrace_if
+#endif
+
+
+
+#ifndef PANDR
+
+connect input PROCESSORTRACE_IF.CLK			=PROCESSOR.CLK
+connect input PROCESSORTRACE_IF.BReset			=PROCESSOR.BReset
+#ifndef NO_TRACE_PORT_MONITOR 
+connect input PROCESSORTRACE_IF.PDebugStatus		=PROCESSOR.PDebugStatus
+connect input PROCESSORTRACE_IF.PDebugPC		=PROCESSOR.PDebugPC
+connect input PROCESSORTRACE_IF.PDebugData		=PROCESSOR.PDebugData
+connect input PROCESSORTRACE_IF.PDebugLS0Stat		=PROCESSOR.PDebugLS0Stat
+connect input PROCESSORTRACE_IF.PDebugLS0Addr		=PROCESSOR.PDebugLS0Addr
+connect input PROCESSORTRACE_IF.PDebugLS0Data		=PROCESSOR.PDebugLS0Data
+#endif /* !NO_TRACE_PORT_MONITOR */
+connect input PROCESSORTRACE_IF.IRam0Addr		=PROCESSOR.IRam0Addr
+connect input PROCESSORTRACE_IF.IRam0WrData		=PROCESSOR.IRam0WrData
+connect input PROCESSORTRACE_IF.IRam0Data		=PROCESSOR.IRam0Data
+connect input PROCESSORTRACE_IF.IRam0LoadStore		=PROCESSOR.IRam0LoadStore
+connect input PROCESSORTRACE_IF.IRam0Wr			=PROCESSOR.IRam0Wr
+connect input PROCESSORTRACE_IF.IRam0En			=PROCESSOR.IRam0En
+connect input PROCESSORTRACE_IF.IRam0WordEn		=PROCESSOR.IRam0WordEn
+connect input PROCESSORTRACE_IF.IRam0Busy		=PROCESSOR.IRam0Busy
+connect input PROCESSORTRACE_IF.DRam0En0		=PROCESSOR.DRam0En0
+connect input PROCESSORTRACE_IF.DRam0Addr0		=PROCESSOR.DRam0Addr0
+connect input PROCESSORTRACE_IF.DRam0Wr0		=PROCESSOR.DRam0Wr0
+connect input PROCESSORTRACE_IF.DRam0WrData0		=PROCESSOR.DRam0WrData0
+connect input PROCESSORTRACE_IF.DRam0Data0		=PROCESSOR.DRam0Data0
+connect input PROCESSORTRACE_IF.DRam0ByteEn0		=PROCESSOR.DRam0ByteEn0
+connect input PROCESSORTRACE_IF.TIE_MemOp_Out_Req	=PROCESSOR.TIE_MemOp_Out_Req
+connect input PROCESSORTRACE_IF.TIE_MemOp_Out		=PROCESSOR.TIE_MemOp_Out
+connect input PROCESSORTRACE_IF.TIE_MemOp_In		=PROCESSOR.TIE_MemOp_In
+
+#endif /* !PANDR */
+
+// The Global_if declaration should only be declared once for all CPUs
+#ifndef PROCESSOR_TRACE_GLOBAL_VCON
+#define PROCESSOR_TRACE_GLOBAL_VCON
+
+connect input ProcessorTrace_Global_if.SystemClock	=TOP_LEVEL.Clk
+connect input ProcessorTrace_Global_if.Test_Finish	=TOP_LEVEL.Test_Finish
+connect input ProcessorTrace_Global_if.TMode		=TOP_LEVEL.TMode
+
+#endif

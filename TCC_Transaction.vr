@@ -1,0 +1,110 @@
+#ifndef INC_TCC_TRANSACTION
+#define INC_TCC_TRANSACTION
+
+//////////////////////////////////////////////////////////////////////////////
+// File name: TCC_Transaction.vr
+//
+// This file represents a TCC transaction. A transaction has a state (IDLE,
+// STARTED, COMMIT_BEGAN, COMMIT_DONE, VIOLATED), and an associated list of
+// Trace_trans which were executed under the transaction.
+//////////////////////////////////////////////////////////////////////////////
+
+//------------------------------------------------------------------------------
+//----- Include Related Files Here
+//------------------------------------------------------------------------------
+
+#include "generic_trans.vrh"
+#include "Trace_trans.vrh"
+
+
+// declare external tasks/classes/functions here if necessary
+
+//------------------------------------------------------------------------------
+//----- Place Special Definitions Here
+//------------------------------------------------------------------------------
+
+// --- Some of the definitions are placed in FromTheVerilog_defs.vrh
+
+//------------------------------------------------------------------------------
+//----- Place Auxiliary Classes Here
+//------------------------------------------------------------------------------
+class TCC_Transaction 
+{
+
+  integer _DEBUG_;
+  /*transactions completed under this TCC transaction*/
+  Trace_trans ttQ[$];
+
+  /*this represents a transaction which is underway*/
+  bit valid;
+
+  /* this represents a transaction which is comitting*/
+  bit committing;
+
+  /* this represents whether a transaction CAN complete.
+   * So, if a transaction is violated (according to the
+   * scoreboard), it will be set. But, just because it is
+   * 0 does not mean that this MUST complete... or does it?
+   * maybe we can check for false-positive violations as well!
+   */
+  bit can_commit;
+
+  /* this represents whether a transaction CAN be violated.
+   * this means that it has read an address that was written
+   * by another transaction. The ultimate violation will
+   * happen depending on the order of commits.
+   */
+  bit can_violate;
+  /*processor issuing this transaction*/
+  integer proc;
+
+    
+  // Constructor 
+  //-------------
+  task new(integer _DEBUG, integer proc);
+  task reset();
+  task LogMeToFile(integer fd);
+}
+//----------------------------------------
+task TCC_Transaction::new(integer _DEBUG, integer _proc)
+{
+  valid = 0;
+  committing = 0;
+  can_commit = 1;
+  proc = _proc;
+  can_violate = 0;
+}
+
+//----------------------------------------
+task TCC_Transaction::reset()
+{
+ Trace_trans popped;
+  valid = 0;
+  committing = 0;
+  can_commit = 1;
+  can_violate = 0;
+  while (!ttQ.empty()){
+    popped = ttQ.pop_front();
+  }
+      
+}
+
+//----------------------------------------
+task TCC_Transaction::LogMeToFile(integer fd)
+{
+  integer ii;
+  if (fd){
+    fprintf(fd, "TCC_Transaction for proc %d:\n", proc);
+    fprintf(fd , " \t VALID= %d, COMMITTING= %d\n, CAN_COMMIT= %d, CAN_VIOLATE= %d", valid, committing, can_commit, can_violate);
+    for (ii = 0; ii < ttQ.size(); ii++){
+      Trace_trans t = ttQ[ii];
+      fprintf(fd, "\t");
+      ttQ[ii].LogMeToFile(fd);
+    }
+    fprintf(fd, "-------------------------------------------------\n");
+  }
+}
+      
+
+
+#endif

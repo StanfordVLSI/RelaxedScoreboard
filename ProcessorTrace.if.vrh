@@ -1,0 +1,95 @@
+/*************************************************************************
+ ** From Perforce:
+ **
+ ** $Id: //Smart_design/Smash_rel/TestCommonLib/Processor/ProcessorTrace/ProcessorTrace.if.vrh#1 $
+ ** $DateTime: 2008/01/04 23:17:34 $
+ ** $Change: 6220 $
+ ** $Author: zasgar $
+ *************************************************************************/
+
+
+//------------------------------------------------------------------------------
+//---- Declaretion of the interface 
+//------------------------------------------------------------------------------
+
+// default name for interface:
+#ifndef PROCESSORTRACE_IF
+#define PROCESSORTRACE_IF ProcessorTrace_if
+#endif
+
+#ifndef PROCESSORTRACE_IF_SKEW
+#define PROCESSORTRACE_IF_SKEW
+#define OUTPUT_EDGE  PHOLD
+#define OUTPUT_SKEW  #1
+#define INPUT_SKEW  #-1
+#define INPUT_EDGE   PSAMPLE
+#endif
+
+
+interface PROCESSORTRACE_IF
+{
+input 		CLK                     CLOCK ;
+input 		BReset                  INPUT_EDGE INPUT_SKEW depth 2;
+input 	[7:0] 	PDebugStatus            INPUT_EDGE INPUT_SKEW;
+input 	[31:0] 	PDebugPC                INPUT_EDGE INPUT_SKEW;
+input 	[31:0] 	PDebugData              INPUT_EDGE INPUT_SKEW;
+input 	[3:0] 	PDebugLS0Stat           INPUT_EDGE INPUT_SKEW;
+input 	[31:0] 	PDebugLS0Addr           INPUT_EDGE INPUT_SKEW;
+input 	[31:0] 	PDebugLS0Data           INPUT_EDGE INPUT_SKEW;
+input 	[26:0] 	IRam0Addr               INPUT_EDGE INPUT_SKEW depth 2;
+input 	[63:0] 	IRam0Data               INPUT_EDGE INPUT_SKEW depth 2;
+input 	[63:0] 	IRam0WrData             INPUT_EDGE INPUT_SKEW depth 2;
+input 		IRam0LoadStore          INPUT_EDGE INPUT_SKEW depth 2;
+input 		IRam0Wr                 INPUT_EDGE INPUT_SKEW depth 2;
+input 		IRam0En                 INPUT_EDGE INPUT_SKEW depth 2;
+input 	[1:0] 	IRam0WordEn             INPUT_EDGE INPUT_SKEW depth 2;
+input           IRam0Busy               INPUT_EDGE INPUT_SKEW depth 2;
+input 		DRam0En0                INPUT_EDGE INPUT_SKEW depth 2;
+input 	[28:0] 	DRam0Addr0              INPUT_EDGE INPUT_SKEW depth 2;
+input 		DRam0Wr0                INPUT_EDGE INPUT_SKEW depth 2;
+input 	[31:0] 	DRam0WrData0            INPUT_EDGE INPUT_SKEW ;
+input 	[31:0] 	DRam0Data0              INPUT_EDGE INPUT_SKEW ;
+input 	[7:0] 	DRam0ByteEn0            INPUT_EDGE INPUT_SKEW depth 2;
+input 	 	TIE_MemOp_Out_Req	INPUT_EDGE INPUT_SKEW depth 2;
+input 	[69:0] 	TIE_MemOp_Out           INPUT_EDGE INPUT_SKEW depth 2;
+input 	[31:0] 	TIE_MemOp_In            INPUT_EDGE INPUT_SKEW;
+} // end of interface 
+
+
+//------------------------------------------------------------------------------
+//----Binding of the the virtual ports 
+//------------------------------------------------------------------------------
+// Ports are defined at ProcessorTrace.port.vrh
+// bind different ports to the different interfaces 
+#ifndef PROCESSORTRACE_PORT
+#define PROCESSORTRACE_PORT ProcessorTrace_port
+#endif
+
+bind ProcessorTrace_IF_port PROCESSORTRACE_PORT
+{
+  CLK                   PROCESSORTRACE_IF.CLK;
+  BReset                PROCESSORTRACE_IF.BReset;
+  PDebugStatus          PROCESSORTRACE_IF.PDebugStatus;
+  PDebugPC              PROCESSORTRACE_IF.PDebugPC;
+  PDebugData            PROCESSORTRACE_IF.PDebugData;
+  PDebugLS0Stat         PROCESSORTRACE_IF.PDebugLS0Stat;
+  PDebugLS0Addr         PROCESSORTRACE_IF.PDebugLS0Addr;
+  PDebugLS0Data         PROCESSORTRACE_IF.PDebugLS0Data;
+  IRam0Addr             PROCESSORTRACE_IF.IRam0Addr;
+  IRam0Data             PROCESSORTRACE_IF.IRam0Data;
+  IRam0WrData           PROCESSORTRACE_IF.IRam0WrData;
+  IRam0LoadStore        PROCESSORTRACE_IF.IRam0LoadStore;
+  IRam0Wr               PROCESSORTRACE_IF.IRam0Wr;
+  IRam0En               PROCESSORTRACE_IF.IRam0En;
+  IRam0WordEn           PROCESSORTRACE_IF.IRam0WordEn;
+  IRam0Busy             PROCESSORTRACE_IF.IRam0Busy;
+  DRam0En0              PROCESSORTRACE_IF.DRam0En0;
+  DRam0Addr0            PROCESSORTRACE_IF.DRam0Addr0;
+  DRam0Wr0              PROCESSORTRACE_IF.DRam0Wr0;
+  DRam0WrData0          PROCESSORTRACE_IF.DRam0WrData0;
+  DRam0Data0            PROCESSORTRACE_IF.DRam0Data0;
+  DRam0ByteEn0          PROCESSORTRACE_IF.DRam0ByteEn0;
+  TIE_MemOp_Out_Req     PROCESSORTRACE_IF.TIE_MemOp_Out_Req;
+  TIE_MemOp_Out         PROCESSORTRACE_IF.TIE_MemOp_Out;
+  TIE_MemOp_In          PROCESSORTRACE_IF.TIE_MemOp_In;
+}

@@ -1,0 +1,63 @@
+#ifndef INC_STORE_QUEUE
+#define INC_STORE_QUEUE
+
+//////////////////////////////////////////////////////////////////////////////
+// File name: Store_Queue.vr
+//
+// This file is just a wrapper around a queue. The intended use is to store
+// all 'outstanding' stores for each processor, to make things go faster.
+//////////////////////////////////////////////////////////////////////////////
+
+//------------------------------------------------------------------------------
+//----- Include Related Files Here
+//------------------------------------------------------------------------------
+
+#include "generic_trans.vrh"
+#include "Trace_trans.vrh"
+
+
+// declare external tasks/classes/functions here if necessary
+
+//------------------------------------------------------------------------------
+//----- Place Special Definitions Here
+//------------------------------------------------------------------------------
+
+// --- Some of the definitions are placed in FromTheVerilog_defs.vrh
+
+//------------------------------------------------------------------------------
+//----- Place Auxiliary Classes Here
+//------------------------------------------------------------------------------
+class Store_Queue 
+{
+
+  integer _DEBUG_;
+  /*Outstanding Stores*/
+  Trace_trans ttQ[$];
+    
+  // Constructor 
+  //-------------
+  task new(integer _DEBUG);
+  task LogMeToFile(integer fd);
+}
+//----------------------------------------
+task Store_Queue::new(integer _DEBUG)
+{
+  _DEBUG_ = _DEBUG;
+}
+
+//----------------------------------------
+task Store_Queue::LogMeToFile(integer fd)
+{
+  integer ii;
+  if (fd){
+    fprintf(fd, "Store_Queue:");
+    for (ii = 0; ii < ttQ.size(); ii++){
+      Trace_trans t = ttQ[ii];
+      fprintf(fd, "\t");
+      ttQ[ii].LogMeToFile(fd);
+    }
+    fprintf(fd, "\n-------------------------------------------------\n");
+  }
+}
+
+#endif
