@@ -1,0 +1,563 @@
+// See LICENSE for license details.
+
+/*************************************************************************
+ ** From Perforce:
+ **
+ ** $Id: //Smart_design/Smash_rel/TestCommonLib/Processor/ProcessorTrace/ProcessorTrace.vr#3 $
+ ** $DateTime: 2008/05/31 21:23:45 $
+ ** $Change: 6806 $
+ ** $Author: shacham $
+ *************************************************************************/
+//
+// Program producing processor trace port trace, IRAM and DRAM traces. TIE 
+// port will need to be added later
+
+//------------------------------------------------------------------------------
+//----- Include Related Files Here
+//------------------------------------------------------------------------------
+// Main source file for tile testbench
+#include <vera_defines.vrh>
+#include <VeraErrorHandler.vrh>
+
+// The super class GENERIC_master is defined here:
+#include "generic_master.vrh"
+
+// define interfaces, and verilog_node here if necessary
+#include "FromTheVerilog_defs.vrh"
+#include "TIE_ops.vrh"
+#include "ProcessorTrace.port.vrh"
+#include "ProcessorTrace_Global.if.vrh"
+
+
+//------------------------------------------------------------------------------
+//----- Place Special Definitions and Extern Declarations Here
+//------------------------------------------------------------------------------
+extern ProcessorTrace_IF_port ProcTrace_Ports_arr[*];
+extern bit RunWithTrace;
+//s  // HELP OFER PLEASE FIX ME (below)!!!
+//s  extern task CheckForSegTableUpdates(bit[31:0] addr, bit[31:0] data); // HELP OFER PLEASE FIX ME!!!
+extern function bit[31:0] TranslateAddress(integer src_ID,
+                                           bit[31:0] addr_in,
+                                           integer op);
+
+//------------------------------------------------------------------------------
+//----- Place Main Class Declaration Here
+//------------------------------------------------------------------------------
+class ProcessorTraceMonitor extends GENERIC_master
+{
+  // control variables
+  //-------------------
+  protected integer my_quadID, my_tileID, my_cpuID, my_ID;
+  protected bit active;
+  protected string file_prefix;
+
+  // Handles to log files:
+  protected integer fd_tp_trace, fd_iram_trace, fd_data_trace;
+
+
+  // Constructor
+  //------------
+  task new(string file_prefix,
+           integer quad, integer tile, integer cpu);
+
+  // Utility tasks
+  //--------------
+  task run();
+  task stop_me();
+
+  // Monitoring tasks
+  //--------------
+  task tpTrace( integer fd );
+  task CollectSingleTpTrace( integer fd );
+  task iramTrace( integer fd );        
+  task CollectSingleIramTrace( integer fd );        
+  task dramTrace( integer fd );
+  task CollectSingleDramTrace( integer fd );
+  task tieTrace( integer fd );
+  task CollectSingleTieTrace( integer fd );
+
+}
+
+
+//------------------------------------------------------------------------------
+//----- Place Implementation of Methods Here
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+//-------------- ProcessorTraceMonitor::new(...)
+task ProcessorTraceMonitor::new(string file_prefix_,
+                                integer quad, integer tile, integer cpu)
+{
+  file_prefix = file_prefix_;
+  my_quadID = quad;
+  my_tileID = tile;
+  my_cpuID = cpu;
+  my_ID = 8*my_quadID+2*my_tileID+my_cpuID;
+
+  // finally enroll to the masters list
+  EnrollToMastersList(); //defined in GENERIC_master
+}
+
+
+//------------------------------------------------------------------------------
+//-------------- ProcessorTraceMonitor::run()
+task ProcessorTraceMonitor::run()
+{
+  active = 1;
+
+  // Open trace log files
+  fd_tp_trace = fopen({file_prefix, "tp.log"}, "w");
+  if (fd_tp_trace == 0) {
+    printf("VERA: ProcessorTrace: Can't open %stp.log\n", file_prefix);
+    exit(2);
+  }
+  fd_iram_trace = fopen({file_prefix, "iram.log"}, "w");
+  if (fd_iram_trace == 0) {
+    printf("VERA: ProcessorTrace: Can't open %siram.log\n", file_prefix);
+    exit(2);
+  }
+  fd_data_trace = fopen({file_prefix, "data.log"}, "w");
+  if (fd_data_trace == 0) {
+    printf("VERA: ProcessorTrace: Can't open %sdata.log\n", file_prefix);
+    exit(2);
+  }
+  
+  
+#ifdef PANDR // this flag is used for gate post place and route simulations
+  printf("WARNING: CPU %0d: PANDR defined --> All processor traces are disabled!\n",
+         my_ID);
+#else /* if not defined PANDR */
+  // Fork off trace threads
+  fork 
+  { tpTrace  ( fd_tp_trace );       }
+  { iramTrace( fd_iram_trace );     }
+  { dramTrace( fd_data_trace );     }
+  { tieTrace ( fd_data_trace );     }
+  join none
+#endif /* PANDR */
+  
+}
+
+
+//------------------------------------------------------------------------------
+//-------------- ProcessorTraceMonitor::tpTrace( integer fd )
+task ProcessorTraceMonitor::tpTrace( integer fd )
+{
+  fprintf( fd, "PDebugStatus\tPDebugData\tPDebugPC\tPDebugLS0Stat\tPDebugLS0Addr\tPDebugLS0Data\n" );
+#ifdef NO_TRACE_PORT_MONITOR // this flag is used for shim tests and gate sims
+  {
+    fprintf(fd_tp_trace,
+            "WARNING: CPU %0d: NO_TRACE_PORT_MONITOR defined --> debug trace is disabled!\n",
+            my_ID);
+    printf("WARNING: CPU %0d: NO_TRACE_PORT_MONITOR defined --> debug trace is disabled!\n",
+           my_ID);
+  }
+#else /* if not defined NO_TRACE_PORT_MONITOR */
+  while( active )
+  {
+    if (ProcessorTrace_Global_if.TMode != 1'b1)
+      CollectSingleTpTrace( fd );
+    @(posedge ProcTrace_Ports_arr[my_ID].$CLK);
+  }
+#endif /* NO_TRACE_PORT_MONITOR */
+}
+
+//------------------------------------------------------------------------------
+//-------------- ProcessorTraceMonitor::CollectSingleTpTrace( integer fd )
+task ProcessorTraceMonitor::CollectSingleTpTrace( integer fd )
+{
+  if (RunWithTrace)
+  {
+    fprintf( fd, "%h\t%h\t%h\t%h\t%h\t%h\n",
+            ProcTrace_Ports_arr[my_ID].$PDebugStatus,
+            ProcTrace_Ports_arr[my_ID].$PDebugData,
+            ProcTrace_Ports_arr[my_ID].$PDebugPC,
+            ProcTrace_Ports_arr[my_ID].$PDebugLS0Stat,
+            ProcTrace_Ports_arr[my_ID].$PDebugLS0Addr,
+            ProcTrace_Ports_arr[my_ID].$PDebugLS0Data );
+    fflush( fd );
+  }
+}
+
+//------------------------------------------------------------------------------
+//-------------- ProcessorTraceMonitor::iramTrace( integer fd )
+task ProcessorTraceMonitor::iramTrace( integer fd )
+{
+  bit [31:0] addr;
+  while( active )
+  {
+    if (ProcessorTrace_Global_if.TMode != 1'b1)
+      CollectSingleIramTrace( fd );
+    @(posedge ProcTrace_Ports_arr[my_ID].$CLK);
+  }
+}
+
+//------------------------------------------------------------------------------
+//-------------- ProcessorTraceMonitor::CollectSingleIramTrace( integer fd )
+task ProcessorTraceMonitor::CollectSingleIramTrace( integer fd )
+{
+  bit [31:0] addr;
+  bit [31:0] phy_addr; 
+
+  if (RunWithTrace)
+  {
+    // First cancel old transactions if IRam0Busy is asserted
+    if ((ProcTrace_Ports_arr[my_ID].$BReset.1 === 1'b0) &&
+        (ProcTrace_Ports_arr[my_ID].$IRam0En.1 === 1'b1) &&
+        (ProcTrace_Ports_arr[my_ID].$IRam0Busy === 1'b1))
+    {
+      addr = { 2'b01, ProcTrace_Ports_arr[my_ID].$IRam0Addr.1, 3'b0};
+      phy_addr = TranslateAddress(my_ID, addr,
+                                  (ProcTrace_Ports_arr[my_ID].$IRam0LoadStore.1)?S_LOAD:S_STORE);
+      fprintf( fd, "Trans Canceled (IRam0Busy)tg=%7d tl=%7d (old trans params:ls=%h we=%h va=%h pa=%h w=%h)\n",
+              get_cycle( ProcessorTrace_Global_if.SystemClock )-1, 
+              get_cycle( ProcTrace_Ports_arr[my_ID].$CLK ),
+              ProcTrace_Ports_arr[my_ID].$IRam0LoadStore.1,
+              ProcTrace_Ports_arr[my_ID].$IRam0Wr.1, 
+              addr,
+              phy_addr,
+              ProcTrace_Ports_arr[my_ID].$IRam0WordEn.1);
+    }     
+    
+    // Secondly, check for data returned by LSU
+    if((ProcTrace_Ports_arr[my_ID].$BReset.2 === 1'b0) &&
+       (ProcTrace_Ports_arr[my_ID].$IRam0En.2 === 1'b1) && 
+       (ProcTrace_Ports_arr[my_ID].$IRam0Wr.2 === 1'b0) &&
+       (ProcTrace_Ports_arr[my_ID].$IRam0Busy.1 === 1'b0) )
+    {
+      addr = { 2'b01, ProcTrace_Ports_arr[my_ID].$IRam0Addr.2, 3'b0};
+      phy_addr = TranslateAddress(my_ID, addr, S_LOAD);
+      fprintf( fd, "data:  tg=%7d tl=%7d va=%h pa=%h     d=%h\n",
+              get_cycle( ProcessorTrace_Global_if.SystemClock )-1, 
+              get_cycle( ProcTrace_Ports_arr[my_ID].$CLK ),
+              addr,
+              phy_addr,
+              ProcTrace_Ports_arr[my_ID].$IRam0Data );
+      fflush( fd );
+    }
+    
+    // Third: look for new transactions (either loads or stores)
+    if( ProcTrace_Ports_arr[my_ID].$BReset === 1'b0)
+    {
+      if( ProcTrace_Ports_arr[my_ID].$IRam0En === 1'b1 ) 
+      {
+        // Print issued transaction
+        addr = { 2'b01, ProcTrace_Ports_arr[my_ID].$IRam0Addr, 3'b0};
+        if( ProcTrace_Ports_arr[my_ID].$IRam0Wr === 1'b1 )
+        {
+          phy_addr = TranslateAddress(my_ID, addr, S_STORE);
+          fprintf( fd, "store: tg=%7d tl=%7d va=%h pa=%h w=%h d=%h\n",
+                  get_cycle( ProcessorTrace_Global_if.SystemClock )-1, 
+                  get_cycle( ProcTrace_Ports_arr[my_ID].$CLK ),
+                  addr,
+                  phy_addr,
+                  ProcTrace_Ports_arr[my_ID].$IRam0WordEn,
+                  ProcTrace_Ports_arr[my_ID].$IRam0WrData );
+        }
+        else if( ProcTrace_Ports_arr[my_ID].$IRam0Wr === 1'b0 )
+        {
+          if( ProcTrace_Ports_arr[my_ID].$IRam0LoadStore === 1'b1 )
+          {
+            phy_addr = TranslateAddress(my_ID, addr, S_LOAD);
+            fprintf( fd, "load:  tg=%7d tl=%7d va=%h pa=%h\n",
+                    get_cycle( ProcessorTrace_Global_if.SystemClock )-1, 
+                    get_cycle( ProcTrace_Ports_arr[my_ID].$CLK ),
+                    addr,
+                    phy_addr,
+                    ProcTrace_Ports_arr[my_ID].$IRam0WordEn );
+          }
+          else
+          {
+            phy_addr = TranslateAddress(my_ID, addr, S_LOAD);
+            fprintf( fd, "fetch: tg=%7d tl=%7d va=%h pa=%h\n",
+                    get_cycle( ProcessorTrace_Global_if.SystemClock )-1, 
+                    get_cycle( ProcTrace_Ports_arr[my_ID].$CLK ),
+                    addr,
+                    phy_addr,
+                    ProcTrace_Ports_arr[my_ID].$IRam0WordEn );
+          }
+        }
+        else
+        {
+          fprintf( fd, "ERROR: ProcessorTrace: tg=%7d tl=%7d IRam0LoadStore=%h IRam0Wr=%h\n",
+                  get_cycle( ProcessorTrace_Global_if.SystemClock )-1, 
+                  get_cycle( ProcTrace_Ports_arr[my_ID].$CLK ),
+                  ProcTrace_Ports_arr[my_ID].$IRam0LoadStore,
+                  ProcTrace_Ports_arr[my_ID].$IRam0Wr );
+          fprintf( stderr, "ERROR: ProcessorTrace: tg=%7d tl=%7d my_ID=%d IRam0LoadStore=%h IRam0Wr=%h\n",
+                  get_cycle( ProcessorTrace_Global_if.SystemClock )-1, 
+                  get_cycle( ProcTrace_Ports_arr[my_ID].$CLK ),
+                  my_ID,
+                  ProcTrace_Ports_arr[my_ID].$IRam0LoadStore,
+                  ProcTrace_Ports_arr[my_ID].$IRam0Wr );
+        }
+        fflush( fd );
+      }
+      if( (ProcTrace_Ports_arr[my_ID].$IRam0En !== 1'b1) &&
+         (ProcTrace_Ports_arr[my_ID].$IRam0En !== 1'b0) )
+      {
+        fprintf( fd, "ERROR: ProcessorTrace: tg=%7d IRam0En0=%h\n",
+                get_cycle( ProcessorTrace_Global_if.SystemClock )-1,
+                ProcTrace_Ports_arr[my_ID].$IRam0En );
+        fprintf( stderr, "ERROR: ProcessorTrace: tg=%7d my_ID=%d IRam0En0=%h\n",
+                get_cycle( ProcessorTrace_Global_if.SystemClock )-1,
+                my_ID,
+                ProcTrace_Ports_arr[my_ID].$IRam0En );
+        fflush( fd );
+      }
+    }
+    
+  } //end of "if (RunWithTrace)..."
+}  
+//------------------------------------------------------------------------------
+//-------------- ProcessorTraceMonitor::dramTrace( integer fd )
+task ProcessorTraceMonitor::dramTrace( integer fd )
+{
+  while( active )
+  {
+    if (ProcessorTrace_Global_if.TMode != 1'b1)
+      CollectSingleDramTrace( fd );
+    @(posedge ProcTrace_Ports_arr[my_ID].$CLK);
+  }
+}
+
+//------------------------------------------------------------------------------
+//-------------- ProcessorTraceMonitor::CollectSingleDramTrace( integer fd )
+task ProcessorTraceMonitor::CollectSingleDramTrace( integer fd )
+{
+  bit [31:0] addr;
+  bit [31:0] phy_addr; 
+
+  if (RunWithTrace)
+  {
+    // First, check for data returned by LSU
+    if( (ProcTrace_Ports_arr[my_ID].$BReset.2 === 1'b0) &&
+       (ProcTrace_Ports_arr[my_ID].$DRam0En0.2 === 1'b1) && 
+       (ProcTrace_Ports_arr[my_ID].$DRam0Wr0.2 === 1'b0) )
+    {
+      addr = {1'b1, ProcTrace_Ports_arr[my_ID].$DRam0Addr0.2, 2'b0};
+      phy_addr = TranslateAddress(my_ID, addr, S_LOAD);
+      fprintf( fd, "data:        tg=%7d tl=%7d va=%h pa=%h be=%h d=%h\n",
+              get_cycle( ProcessorTrace_Global_if.SystemClock )-1,
+              get_cycle( ProcTrace_Ports_arr[my_ID].$CLK ),
+              addr, 
+              phy_addr, 
+              ProcTrace_Ports_arr[my_ID].$DRam0ByteEn0.2,
+              ProcTrace_Ports_arr[my_ID].$DRam0Data0 );
+      fflush( fd );
+    }
+    
+    if( ProcTrace_Ports_arr[my_ID].$BReset === 1'b0)
+    {
+      if( ProcTrace_Ports_arr[my_ID].$DRam0En0 === 1'b1 )
+      {
+        // Print issued transaction
+        if( ProcTrace_Ports_arr[my_ID].$DRam0Wr0 === 1'b1 )
+        {
+          addr = { 1'b1, ProcTrace_Ports_arr[my_ID].$DRam0Addr0, 2'b0};
+          phy_addr = TranslateAddress(my_ID, addr, S_STORE);
+          fprintf( fd, "store:       tg=%7d tl=%7d va=%h pa=%h be=%h d=%h\n",
+                  get_cycle( ProcessorTrace_Global_if.SystemClock )-1, 
+                  get_cycle( ProcTrace_Ports_arr[my_ID].$CLK ),
+                  addr, 
+                  phy_addr, 
+                  ProcTrace_Ports_arr[my_ID].$DRam0ByteEn0,
+                  ProcTrace_Ports_arr[my_ID].$DRam0WrData0 );
+        }
+        else if( ProcTrace_Ports_arr[my_ID].$DRam0Wr0 === 1'b0 )
+        {
+          addr = {1'b1, ProcTrace_Ports_arr[my_ID].$DRam0Addr0, 2'b0};
+          phy_addr = TranslateAddress(my_ID, addr, S_LOAD);
+          fprintf( fd, "load:        tg=%7d tl=%7d va=%h pa=%h be=%h\n",
+                  get_cycle( ProcessorTrace_Global_if.SystemClock )-1, 
+                  get_cycle( ProcTrace_Ports_arr[my_ID].$CLK ),
+                  addr, 
+                  phy_addr, 
+                  ProcTrace_Ports_arr[my_ID].$DRam0ByteEn0 );
+        }
+        else
+          fprintf( stderr, "ERROR: ProcessorTrace: tg=%7d my_ID=%d DRam0Wr0=%h\n",
+                  get_cycle( ProcessorTrace_Global_if.SystemClock )-1,
+                  my_ID,
+                  ProcTrace_Ports_arr[my_ID].$DRam0Wr0 );
+        fflush( fd );
+      }
+      if( (ProcTrace_Ports_arr[my_ID].$DRam0En0 !== 1'b1) &&
+         (ProcTrace_Ports_arr[my_ID].$DRam0En0 !== 1'b0) )
+      {
+        fprintf( stderr, "ERROR: ProcessorTrace: tg=%7d my_ID=%d DRam0En0=%h\n",
+                get_cycle( ProcessorTrace_Global_if.SystemClock )-1,
+                my_ID,
+                ProcTrace_Ports_arr[my_ID].$DRam0En0 );
+        fflush( fd );
+      }
+    }
+  } // end of "if (RunWithTrace)..."
+}
+
+//------------------------------------------------------------------------------
+//-------------- ProcessorTraceMonitor::tieTrace( integer fd )
+task ProcessorTraceMonitor::tieTrace( integer fd )
+{
+  while( active )
+  {
+    if (ProcessorTrace_Global_if.TMode != 1'b1)
+      CollectSingleTieTrace( fd );
+    @(posedge ProcTrace_Ports_arr[my_ID].$CLK);
+  }
+
+}
+
+//------------------------------------------------------------------------------
+//-------------- ProcessorTraceMonitor::CollectSingleTieTrace( integer fd )
+task ProcessorTraceMonitor::CollectSingleTieTrace( integer fd )
+{
+  bit [69:0] prevMemOp_Out = ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out.2;
+  bit [5:0]  prevOpCode    = prevMemOp_Out[69:64];
+
+  bit [31:0] addr;
+  bit [31:0] phy_addr; 
+
+  if (RunWithTrace)
+  {
+    // First, check for data returned by LSU
+    if( (ProcTrace_Ports_arr[my_ID].$BReset.2 === 1'b0) &&
+       (ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out_Req.2 === 1'b1) && 
+       (( prevOpCode === SYNCH_LOAD ) || ( prevOpCode === FUTURE_LOAD )   ||
+        ( prevOpCode === RESET_LOAD ) || ( prevOpCode === META_LOAD )     ||
+        ( prevOpCode === RAW_LOAD )   || ( prevOpCode === RAW_META_LOAD ) ||
+        ( prevOpCode === FIFO_LOAD )  || ( prevOpCode === SPEC_REG_READ ) ||
+        ( prevOpCode === SAFE_LOAD )  || ( prevOpCode === TEST_SET )      ||
+        ( prevOpCode === TEST_RESET ) ) )
+    {
+      addr = prevMemOp_Out[31:0];
+      phy_addr = TranslateAddress(my_ID, addr, prevOpCode);
+      fprintf( fd, "data:        tg=%7d tl=%7d va=%h pa=%h       d=%h\n",
+              get_cycle( ProcessorTrace_Global_if.SystemClock )-1,
+              get_cycle( ProcTrace_Ports_arr[my_ID].$CLK ),
+              addr,
+              phy_addr,
+              ProcTrace_Ports_arr[my_ID].$TIE_MemOp_In );
+      fflush( fd );
+    }
+    
+    if( ProcTrace_Ports_arr[my_ID].$BReset === 1'b0)
+    {
+      if( ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out_Req === 1'b1 )
+      {
+        bit [69:0] MemOp_Out = ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out;
+        string opCodeName;
+        case( MemOp_Out[69:64] )
+        {
+          FUTURE_LOAD:           opCodeName = "fut_load:   ";
+          SYNCH_LOAD:            opCodeName = "syn_load:   ";
+          SYNCH_STORE:           opCodeName = "syn_store:  ";
+          RESET_LOAD:            opCodeName = "res_load:   ";
+          SET_STORE:             opCodeName = "set_store:  ";
+          META_LOAD:             opCodeName = "meta_load:  ";
+          META_STORE:            opCodeName = "meta_store: ";
+          RAW_LOAD:              opCodeName = "raw_load:   ";
+          RAW_STORE:             opCodeName = "raw_store:  ";
+          RAW_META_LOAD:         opCodeName = "rmeta_load: ";
+          RAW_META_STORE:        opCodeName = "rmeta_store:";
+          FIFO_LOAD:             opCodeName = "fifo_load:  ";
+          FIFO_STORE:            opCodeName = "fifo_store: ";
+          CACHE_GANG_WRITE:      opCodeName = "cache_gang: ";
+          CACHE_COND_GANG_WRITE: opCodeName = "c_c_gang:   ";
+          MAT_GANG_WRITE:        opCodeName = "mat_gang:   ";
+          MAT_COND_GANG_WRITE:   opCodeName = "c_mat_gang: ";
+          SPEC_CMD:              opCodeName = "spec_cmd:   ";
+          SPEC_REG_READ:         opCodeName = "spec_read:  ";
+          SPEC_REG_WRITE:        opCodeName = "spec_write: ";
+          SAFE_LOAD:             opCodeName = "safe_load:  ";
+          TEST_SET:              opCodeName = "test_set:   ";
+          TEST_RESET:            opCodeName = "test_reset: ";
+          HARD_INT_ACK:          opCodeName = "hard_ack:   ";
+          MEM_BAR:               opCodeName = "mem_bar:    ";
+          SM_IPF:                opCodeName = "ipf:        ";
+          SM_DPFW:               opCodeName = "dpfw:       ";
+          SM_DPFR:               opCodeName = "dpfr:       ";
+          SM_IHI:                opCodeName = "ihi:        ";
+          SM_DHI:                opCodeName = "dhi:        ";
+          SM_DHWB:               opCodeName = "dhwb:       ";
+          SM_DHWBI:              opCodeName = "dhwbi:      ";
+          SM_III:                opCodeName = "iii:        ";
+          SM_DII:                opCodeName = "dii:        ";
+          SM_DIWB:               opCodeName = "diwb:       ";
+          SM_DIWBI:              opCodeName = "diwbi:      ";
+          SPEC_CMD:              opCodeName = "spec_cmd:   ";
+          default:
+          {
+                                 opCodeName = "error:      ";
+
+            fprintf( stderr, "ERROR: ProcessorTrace: unknown opcode tg=%7d tl=%7d my_ID=%d opcode=%d va=%h\n",
+                    get_cycle( ProcessorTrace_Global_if.SystemClock )-1, 
+                    get_cycle( ProcTrace_Ports_arr[my_ID].$CLK ),
+                    my_ID,
+                    MemOp_Out[69:64],
+                    MemOp_Out[31:0] );
+          }
+        }
+        
+        addr = MemOp_Out[31:0];
+        phy_addr = TranslateAddress(my_ID, addr, MemOp_Out[69:64]);
+
+        // Print issued transaction
+        fprintf( fd, "%s tg=%7d tl=%7d va=%h pa=%h",
+                opCodeName,
+                get_cycle( ProcessorTrace_Global_if.SystemClock )-1, 
+                get_cycle( ProcTrace_Ports_arr[my_ID].$CLK ),
+                addr,
+                phy_addr);
+
+//s   	// HELP OFER PLEASE FIX ME (below)!!!
+//s   	if (MemOp_Out[69:64] == RAW_STORE) { CheckForSegTableUpdates(addr, MemOp_Out[63:32]); } // HELP OFER PLEASE FIX ME!!!
+   
+        if( MemOp_Out[69:64] === SYNCH_STORE            ||
+           MemOp_Out[69:64] === SET_STORE               ||
+           MemOp_Out[69:64] === META_STORE              ||
+           MemOp_Out[69:64] === RAW_STORE               ||
+           MemOp_Out[69:64] === RAW_META_STORE          ||
+           MemOp_Out[69:64] === FIFO_STORE              ||
+           MemOp_Out[69:64] === CACHE_GANG_WRITE        ||
+           MemOp_Out[69:64] === CACHE_COND_GANG_WRITE   ||
+           MemOp_Out[69:64] === MAT_GANG_WRITE          ||
+           MemOp_Out[69:64] === MAT_COND_GANG_WRITE     ||
+           MemOp_Out[69:64] === SPEC_REG_WRITE )
+          fprintf( fd, "       d=%h\n", MemOp_Out[63:32] );
+        else
+          fprintf( fd, "\n" );
+        fflush( fd );
+      }
+      else if( ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out_Req !== 1'b0 )
+      {
+        fprintf( fd, "error: tg=%7d TIE_MemOp_Out_Req=%h\n",
+                get_cycle( ProcessorTrace_Global_if.SystemClock )-1,
+                ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out_Req );
+        fprintf( stderr, "ERROR: ProcessorTrace: tg=%7d my_ID=%d TIE_MemOp_Out_Req=%h\n",
+                get_cycle( ProcessorTrace_Global_if.SystemClock )-1,
+                my_ID,
+                ProcTrace_Ports_arr[my_ID].$TIE_MemOp_Out_Req );
+        fflush( fd );
+      }
+    }
+    
+  } // end of "if (RunWithTrace)..."
+}
+
+//------------------------------------------------------------------------------
+//-------------- ProcessorTraceMonitor::stop_me()
+task ProcessorTraceMonitor::stop_me()
+{
+  //@(posedge ProcessorTrace_Global_if.Test_Finish);
+
+  active = 0;
+  //repeat (10) @(posedge ProcTrace_Ports_arr[my_ID].$CLK);
+  fclose( fd_tp_trace );
+  fclose( fd_iram_trace );
+  fclose( fd_data_trace );
+
+  printf ("\n************* ProcessorTraceMonitor %0d Finished ***************\n", my_ID);
+  printf (  "**************** Final Time Stamp: %10d ****************\n",get_cycle());
+  printf (  "**************************************************************\n");
+}

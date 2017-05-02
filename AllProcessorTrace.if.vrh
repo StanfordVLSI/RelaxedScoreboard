@@ -1,0 +1,42 @@
+// See LICENSE for license details.
+
+/*************************************************************************
+ ** From Perforce:
+ **
+ ** $Id: //Smart_design/Smash_rel/TestCommonLib/Quad/AllProcessorTrace.if.vrh#1 $
+ ** $DateTime: 2008/01/04 23:17:34 $
+ ** $Change: 6220 $
+ ** $Author: zasgar $
+ *************************************************************************/
+
+// The following code, creates 8 interfaces objects of ProcessorTrace
+#define PROCESSORTRACE_IF T0P0_ProcessorTrace_if
+#define PROCESSORTRACE_PORT T0P0_ProcessorTrace_port
+#include "ProcessorTrace.if.vrh"
+#define PROCESSORTRACE_IF T0P1_ProcessorTrace_if
+#define PROCESSORTRACE_PORT T0P1_ProcessorTrace_port
+#include "ProcessorTrace.if.vrh"
+
+
+#define PROCESSORTRACE_IF T1P0_ProcessorTrace_if
+#define PROCESSORTRACE_PORT T1P0_ProcessorTrace_port
+#include "ProcessorTrace.if.vrh"
+#define PROCESSORTRACE_IF T1P1_ProcessorTrace_if
+#define PROCESSORTRACE_PORT T1P1_ProcessorTrace_port
+#include "ProcessorTrace.if.vrh"
+
+
+#define PROCESSORTRACE_IF T2P0_ProcessorTrace_if
+#define PROCESSORTRACE_PORT T2P0_ProcessorTrace_port
+#include "ProcessorTrace.if.vrh"
+#define PROCESSORTRACE_IF T2P1_ProcessorTrace_if
+#define PROCESSORTRACE_PORT T2P1_ProcessorTrace_port
+#include "ProcessorTrace.if.vrh"
+
+
+#define PROCESSORTRACE_IF T3P0_ProcessorTrace_if
+#define PROCESSORTRACE_PORT T3P0_ProcessorTrace_port
+#include "ProcessorTrace.if.vrh"
+#define PROCESSORTRACE_IF T3P1_ProcessorTrace_if
+#define PROCESSORTRACE_PORT T3P1_ProcessorTrace_port
+#include "ProcessorTrace.if.vrh"

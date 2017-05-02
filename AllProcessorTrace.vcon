@@ -1,0 +1,54 @@
+// See LICENSE for license details.
+
+/*************************************************************************
+ ** From Perforce:
+ **
+ ** $Id: //Smart_design/Smash_rel/TestCommonLib/Quad/AllProcessorTrace.vcon#3 $
+ ** $DateTime: 2008/05/29 14:21:31 $
+ ** $Change: 6797 $
+ ** $Author: shacham $
+ *************************************************************************/
+
+#ifndef INC_ALL_PROC_TRACE_VCON
+#define INC_ALL_PROC_TRACE_VCON
+
+#include "QuadHierarchy_def.vcon"
+
+#define TOP_LEVEL QUAD_SIM
+
+#define PROCESSOR 		TILE_0_PROC_0
+#define PROCESSORTRACE_IF 	T0P0_ProcessorTrace_if
+#include "ProcessorTrace.vcon"
+
+#define PROCESSOR 		TILE_1_PROC_0
+#define PROCESSORTRACE_IF 	T1P0_ProcessorTrace_if
+#include "ProcessorTrace.vcon"
+
+#define PROCESSOR 		TILE_2_PROC_0
+#define PROCESSORTRACE_IF 	T2P0_ProcessorTrace_if
+#include "ProcessorTrace.vcon"
+
+#define PROCESSOR 		TILE_3_PROC_0
+#define PROCESSORTRACE_IF 	T3P0_ProcessorTrace_if
+#include "ProcessorTrace.vcon"
+
+#ifndef P0_ONLY
+#define PROCESSOR 		TILE_0_PROC_1
+#define PROCESSORTRACE_IF 	T0P1_ProcessorTrace_if
+#include "ProcessorTrace.vcon"
+
+#define PROCESSOR 		TILE_1_PROC_1
+#define PROCESSORTRACE_IF 	T1P1_ProcessorTrace_if
+#include "ProcessorTrace.vcon"
+
+
+#define PROCESSOR 		TILE_2_PROC_1
+#define PROCESSORTRACE_IF 	T2P1_ProcessorTrace_if
+#include "ProcessorTrace.vcon"
+
+#define PROCESSOR 		TILE_3_PROC_1
+#define PROCESSORTRACE_IF 	T3P1_ProcessorTrace_if
+#include "ProcessorTrace.vcon"
+#endif /* P0_ONLY */
+
+#endif /* INC_ALL_PROC_TRACE_VCON */
